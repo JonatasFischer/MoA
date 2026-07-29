@@ -1,0 +1,21 @@
+server:
+  host: 127.0.0.1
+  port: 8080
+  api_key_env: MOA_API_KEY
+
+providers:
+  ollama:
+    type: openai-compatible
+    base_url: http://127.0.0.1:11434/v1
+    timeout_seconds: 300
+
+profiles:
+  code:
+    aliases:
+      - claude-moa-code
+      - moa-code
+    strategy: direct
+    provider: ollama
+    model: qwen2.5-coder:7b
+
+default_profile: code
