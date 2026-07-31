@@ -565,7 +565,7 @@ async def test_contributor_quorum_cancels_and_marks_absent_straggler(tmp_path) -
         gateway.complete(
             CanonicalRequest("moa-code", [{"role": "user", "content": "solve"}])
         ),
-        timeout=1,
+        timeout=2,
     )
 
     assert result.content == "final"

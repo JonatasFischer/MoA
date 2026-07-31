@@ -816,7 +816,7 @@ class Gateway:
             else None
         )
         try:
-            while pending and len(proposals) < profile.min_quorum:
+            while pending:
                 timeout = (
                     max(0.0, deadline_at - asyncio.get_running_loop().time())
                     if deadline_at is not None

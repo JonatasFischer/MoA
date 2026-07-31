@@ -208,9 +208,9 @@ def test_council_requires_all_distinct_contributor_families() -> None:
         "gemma",
         "deepseek",
     }
-    assert profile.aggregator.model == "qwen3.6:27b"
-    assert profile.aggregator.think is False
-    assert profile.tool_dispatch.model == "qwen3.6:27b"
+    assert profile.aggregator.model == "Qwen/Qwen3-Coder-Next-FP8"
+    assert profile.aggregator.think is None
+    assert profile.tool_dispatch.model == "Qwen/Qwen3-Coder-Next-FP8"
     assert profile.reasoning_reserve == {"qwen": 4096}
 
     broken = config.model_dump(by_alias=True)
@@ -220,7 +220,7 @@ def test_council_requires_all_distinct_contributor_families() -> None:
 
     assert profile.min_quorum == 2
     assert profile.contributor_deadline_seconds == 45
-    assert profile.max_concurrency == 1
+    assert profile.max_concurrency == 3
     assert profile.contributor_format == "json-schema"
 
     broken = config.model_dump(by_alias=True)
