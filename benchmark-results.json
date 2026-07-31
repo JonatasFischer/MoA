@@ -1,0 +1,228 @@
+{
+  "profiles": [
+    "direct",
+    "code"
+  ],
+  "runs": 3,
+  "cases": [
+    "merge_intervals",
+    "topological_order",
+    "lru_cache"
+  ],
+  "summary": {
+    "direct": {
+      "passed": 9,
+      "total": 9,
+      "pass_rate": 1.0,
+      "mean_latency_seconds": 2.601,
+      "panel_tokens": 2661
+    },
+    "code": {
+      "passed": 9,
+      "total": 9,
+      "pass_rate": 1.0,
+      "mean_latency_seconds": 13.017,
+      "panel_tokens": 22523
+    }
+  },
+  "results": [
+    {
+      "profile": "direct",
+      "strategy": "direct",
+      "case": "merge_intervals",
+      "run": 1,
+      "passed": true,
+      "latency_seconds": 2.191,
+      "final_tokens": 252,
+      "panel_tokens": 252,
+      "error": null
+    },
+    {
+      "profile": "code",
+      "strategy": "classic",
+      "case": "merge_intervals",
+      "run": 1,
+      "passed": true,
+      "latency_seconds": 9.086,
+      "final_tokens": 1135,
+      "panel_tokens": 1914,
+      "error": null
+    },
+    {
+      "profile": "direct",
+      "strategy": "direct",
+      "case": "topological_order",
+      "run": 1,
+      "passed": true,
+      "latency_seconds": 3.483,
+      "final_tokens": 380,
+      "panel_tokens": 380,
+      "error": null
+    },
+    {
+      "profile": "code",
+      "strategy": "classic",
+      "case": "topological_order",
+      "run": 1,
+      "passed": true,
+      "latency_seconds": 15.084,
+      "final_tokens": 1690,
+      "panel_tokens": 2855,
+      "error": null
+    },
+    {
+      "profile": "direct",
+      "strategy": "direct",
+      "case": "lru_cache",
+      "run": 1,
+      "passed": true,
+      "latency_seconds": 2.133,
+      "final_tokens": 255,
+      "panel_tokens": 255,
+      "error": null
+    },
+    {
+      "profile": "code",
+      "strategy": "classic",
+      "case": "lru_cache",
+      "run": 1,
+      "passed": true,
+      "latency_seconds": 15.567,
+      "final_tokens": 1692,
+      "panel_tokens": 2864,
+      "error": null
+    },
+    {
+      "profile": "direct",
+      "strategy": "direct",
+      "case": "merge_intervals",
+      "run": 2,
+      "passed": true,
+      "latency_seconds": 2.146,
+      "final_tokens": 252,
+      "panel_tokens": 252,
+      "error": null
+    },
+    {
+      "profile": "code",
+      "strategy": "classic",
+      "case": "merge_intervals",
+      "run": 2,
+      "passed": true,
+      "latency_seconds": 8.219,
+      "final_tokens": 1055,
+      "panel_tokens": 1822,
+      "error": null
+    },
+    {
+      "profile": "direct",
+      "strategy": "direct",
+      "case": "topological_order",
+      "run": 2,
+      "passed": true,
+      "latency_seconds": 3.506,
+      "final_tokens": 380,
+      "panel_tokens": 380,
+      "error": null
+    },
+    {
+      "profile": "code",
+      "strategy": "classic",
+      "case": "topological_order",
+      "run": 2,
+      "passed": true,
+      "latency_seconds": 15.436,
+      "final_tokens": 1703,
+      "panel_tokens": 2854,
+      "error": null
+    },
+    {
+      "profile": "direct",
+      "strategy": "direct",
+      "case": "lru_cache",
+      "run": 2,
+      "passed": true,
+      "latency_seconds": 2.129,
+      "final_tokens": 255,
+      "panel_tokens": 255,
+      "error": null
+    },
+    {
+      "profile": "code",
+      "strategy": "classic",
+      "case": "lru_cache",
+      "run": 2,
+      "passed": true,
+      "latency_seconds": 16.23,
+      "final_tokens": 1757,
+      "panel_tokens": 2972,
+      "error": null
+    },
+    {
+      "profile": "direct",
+      "strategy": "direct",
+      "case": "merge_intervals",
+      "run": 3,
+      "passed": true,
+      "latency_seconds": 2.173,
+      "final_tokens": 252,
+      "panel_tokens": 252,
+      "error": null
+    },
+    {
+      "profile": "code",
+      "strategy": "classic",
+      "case": "merge_intervals",
+      "run": 3,
+      "passed": true,
+      "latency_seconds": 7.382,
+      "final_tokens": 958,
+      "panel_tokens": 1657,
+      "error": null
+    },
+    {
+      "profile": "direct",
+      "strategy": "direct",
+      "case": "topological_order",
+      "run": 3,
+      "passed": true,
+      "latency_seconds": 3.511,
+      "final_tokens": 380,
+      "panel_tokens": 380,
+      "error": null
+    },
+    {
+      "profile": "code",
+      "strategy": "classic",
+      "case": "topological_order",
+      "run": 3,
+      "passed": true,
+      "latency_seconds": 14.415,
+      "final_tokens": 1621,
+      "panel_tokens": 2733,
+      "error": null
+    },
+    {
+      "profile": "direct",
+      "strategy": "direct",
+      "case": "lru_cache",
+      "run": 3,
+      "passed": true,
+      "latency_seconds": 2.133,
+      "final_tokens": 255,
+      "panel_tokens": 255,
+      "error": null
+    },
+    {
+      "profile": "code",
+      "strategy": "classic",
+      "case": "lru_cache",
+      "run": 3,
+      "passed": true,
+      "latency_seconds": 15.738,
+      "final_tokens": 1686,
+      "panel_tokens": 2852,
+      "error": null
+    }
+  ]
+}

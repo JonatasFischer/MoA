@@ -1,0 +1,55 @@
+{
+  "profiles": [
+    "code"
+  ],
+  "runs": 1,
+  "cases": [
+    "merge_intervals",
+    "topological_order",
+    "lru_cache"
+  ],
+  "summary": {
+    "code": {
+      "passed": 0,
+      "total": 3,
+      "pass_rate": 0.0,
+      "mean_latency_seconds": 325.404,
+      "panel_tokens": 15222
+    }
+  },
+  "results": [
+    {
+      "profile": "code",
+      "strategy": "council",
+      "case": "merge_intervals",
+      "run": 1,
+      "passed": false,
+      "latency_seconds": 202.322,
+      "final_tokens": 2307,
+      "panel_tokens": 4779,
+      "error": "Traceback (most recent call last):\n  File \"/var/folders/wv/_tnzl8112n16jg6klvk2ffk00000gn/T/moa-benchmark-w0ywqzu7/test_solution.py\", line 1, in <module>\n    from solution import merge_intervals\nImportError: cannot import name 'merge_intervals' from 'solution' (/private/var/folders/wv/_tnzl8112n16jg6klvk2ffk00000gn/T/moa-benchmark-w0ywqzu7/solution.py)"
+    },
+    {
+      "profile": "code",
+      "strategy": "council",
+      "case": "topological_order",
+      "run": 1,
+      "passed": false,
+      "latency_seconds": 349.251,
+      "final_tokens": 2338,
+      "panel_tokens": 5255,
+      "error": "Traceback (most recent call last):\n  File \"/var/folders/wv/_tnzl8112n16jg6klvk2ffk00000gn/T/moa-benchmark-s4vmt8if/test_solution.py\", line 1, in <module>\n    from solution import topological_order\nImportError: cannot import name 'topological_order' from 'solution' (/private/var/folders/wv/_tnzl8112n16jg6klvk2ffk00000gn/T/moa-benchmark-s4vmt8if/solution.py)"
+    },
+    {
+      "profile": "code",
+      "strategy": "council",
+      "case": "lru_cache",
+      "run": 1,
+      "passed": false,
+      "latency_seconds": 424.638,
+      "final_tokens": 2454,
+      "panel_tokens": 5188,
+      "error": "Traceback (most recent call last):\n  File \"/var/folders/wv/_tnzl8112n16jg6klvk2ffk00000gn/T/moa-benchmark-qyalgtw3/test_solution.py\", line 1, in <module>\n    from solution import LRUCache\nImportError: cannot import name 'LRUCache' from 'solution' (/private/var/folders/wv/_tnzl8112n16jg6klvk2ffk00000gn/T/moa-benchmark-qyalgtw3/solution.py)"
+    }
+  ]
+}

@@ -252,9 +252,13 @@ discovery to include it. Several aliases may resolve to one profile.
 ### 6. Additional Strategies and Evaluation
 
 - Add Self-MoA, sequential, judge/synthesis, roles, routing, and early exit.
-- Benchmark solo and MoA on identical coding tasks.
-- Measure tool-call validity, patch correctness, test success, latency, token
-  use, and failure recovery rather than relying only on prose benchmarks.
+- Benchmark `direct`, `council-k2`, `council-k3`, and repeated-sample
+  `self-consistency` on identical coding tasks. The benchmark arm does not imply
+  a separate production self-consistency strategy.
+- Measure pass@1, p50/p95 latency, split input/output token use, and failure
+  recovery rather than relying only on prose benchmarks.
+- Keep `direct` unless another strategy produces a strict pass@1 improvement;
+  use p95 latency and total tokens only as tie-breakers among quality gains.
 
 ## Usage Accounting
 
@@ -278,6 +282,8 @@ per-request stage details.
 - Client disconnect cancels outstanding provider requests.
 - Unknown optional fields do not crash request parsing.
 - The default MoA profile is evaluated against a direct baseline.
+- The four-arm evaluation reports pass@1, p50/p95 latency, split token totals,
+  and a direct-baseline promotion decision.
 
 ## Risks
 

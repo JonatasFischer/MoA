@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 
 import httpx
 import pytest
 
 from moa_gateway.app import create_app
 from moa_gateway.config import GatewayConfig
+from moa_gateway.domain import CanonicalRequest, Completion, StreamEvent
 
 
 @pytest.mark.asyncio
@@ -47,6 +49,58 @@ async def test_chat_completion_translation(api) -> None:
     assert model == "local-model"
     assert request.messages == [{"role": "user", "content": "hi"}]
     assert request.max_tokens == 100
+
+
+@pytest.mark.asyncio
+async def test_request_correlation_headers(api) -> None:
+    client, _ = api
+
+    response = await client.post(
+        "/v1/chat/completions",
+        headers={"X-MoA-Parent-Request-ID": "parent:123"},
+        json={
+            "model": "moa-code",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+
+    assert len(response.headers["x-moa-request-id"]) == 32
+    assert response.headers["x-moa-parent-request-id"] == "parent:123"
+
+
+@pytest.mark.asyncio
+async def test_rejects_invalid_parent_request_id(api) -> None:
+    client, provider = api
+
+    response = await client.post(
+        "/v1/chat/completions",
+        headers={"X-MoA-Parent-Request-ID": "invalid value"},
+        json={
+            "model": "moa-code",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+
+    assert response.status_code == 400
+    assert provider.requests == []
+
+
+@pytest.mark.asyncio
+async def test_deepseek_style_unversioned_chat_endpoint(api) -> None:
+    client, _ = api
+
+    models = await client.get("/models")
+    response = await client.post(
+        "/chat/completions",
+        json={
+            "model": "moa-code",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+
+    assert models.status_code == 200
+    assert response.status_code == 200
+    assert response.json()["object"] == "chat.completion"
 
 
 @pytest.mark.asyncio
@@ -105,14 +159,6 @@ async def test_responses_translation(api) -> None:
     ("path", "body"),
     [
         (
-            "/v1/chat/completions",
-            {
-                "model": "moa-code",
-                "messages": [{"role": "user", "content": "hi"}],
-                "tools": [{"type": "function", "function": {"name": "read"}}],
-            },
-        ),
-        (
             "/v1/messages",
             {
                 "model": "claude-moa-code",
@@ -152,6 +198,68 @@ async def test_unknown_model_returns_404(api) -> None:
         },
     )
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_streaming_upstream_failure_emits_terminal_error_after_progress() -> None:
+    class EmptyProvider:
+        async def complete(
+            self, model: str, request: CanonicalRequest
+        ) -> Completion:
+            return Completion(content="", model=model, finish_reason="length")
+
+        async def stream(
+            self, model: str, request: CanonicalRequest
+        ) -> AsyncIterator[StreamEvent]:
+            yield StreamEvent(finish_reason="length", done=True)
+
+        async def close(self) -> None:
+            return None
+
+    config = GatewayConfig.model_validate(
+        {
+            "server": {"api_key_env": None},
+            "providers": {
+                "local": {
+                    "type": "openai-compatible",
+                    "base_url": "http://local.test/v1",
+                }
+            },
+            "profiles": {
+                "code": {
+                    "aliases": ["moa-code"],
+                    "strategy": "council",
+                    "contributors": [
+                        {"provider": "local", "model": "one", "family": "one"},
+                        {"provider": "local", "model": "two", "family": "two"},
+                        {
+                            "provider": "local",
+                            "model": "three",
+                            "family": "three",
+                        },
+                    ],
+                    "aggregator": {"provider": "local", "model": "final"},
+                    "min_quorum": 3,
+                }
+            },
+            "default_profile": "code",
+        }
+    )
+    app = create_app(config, {"local": EmptyProvider()})
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "moa-code",
+                "messages": [{"role": "user", "content": "solve"}],
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    assert ": moa-progress collecting contributor quorum" in response.text
+    assert '"code":"upstream_error"' in response.text
 
 
 @pytest.mark.asyncio

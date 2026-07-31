@@ -1,0 +1,87 @@
+{
+  "pyproject.toml": {
+    "mtime": 1785321426.4694793,
+    "ast_hash": "63c0fa8087de92e8b21464504a649afa",
+    "semantic_hash": ""
+  },
+  "src/moa_gateway/__init__.py": {
+    "mtime": 1785321561.0646007,
+    "ast_hash": "5360076ef394df80ef9a6ceba310ace1",
+    "semantic_hash": ""
+  },
+  "src/moa_gateway/__main__.py": {
+    "mtime": 1785321561.0651433,
+    "ast_hash": "c842d73dd0f27fd566a43f735aea02ba",
+    "semantic_hash": ""
+  },
+  "src/moa_gateway/app.py": {
+    "mtime": 1785323057.9712787,
+    "ast_hash": "a2f66326171cb789acdb13b375547f36",
+    "semantic_hash": ""
+  },
+  "src/moa_gateway/cli.py": {
+    "mtime": 1785323111.5836654,
+    "ast_hash": "af14a92465950c624085b6d0450d88de",
+    "semantic_hash": ""
+  },
+  "src/moa_gateway/config.py": {
+    "mtime": 1785321561.0654619,
+    "ast_hash": "0bd447a93b21c8d6e5da6498b85c7c46",
+    "semantic_hash": ""
+  },
+  "src/moa_gateway/domain.py": {
+    "mtime": 1785321561.0656974,
+    "ast_hash": "b45106b4f113a8ade5bd6da231517a5d",
+    "semantic_hash": ""
+  },
+  "src/moa_gateway/gateway.py": {
+    "mtime": 1785321561.0664108,
+    "ast_hash": "cb85c47ea245fae53936e4d94abacc8c",
+    "semantic_hash": ""
+  },
+  "src/moa_gateway/protocols.py": {
+    "mtime": 1785321714.097991,
+    "ast_hash": "119e0ae5ea71e5cac413b240064ce8c3",
+    "semantic_hash": ""
+  },
+  "src/moa_gateway/provider.py": {
+    "mtime": 1785321561.066194,
+    "ast_hash": "e349eb450cb01fffdc6f53554183a919",
+    "semantic_hash": ""
+  },
+  "tests/conftest.py": {
+    "mtime": 1785323013.2032766,
+    "ast_hash": "d80f2235e3a1ff87b93bb67c7304c282",
+    "semantic_hash": ""
+  },
+  "tests/test_api.py": {
+    "mtime": 1785323031.0892506,
+    "ast_hash": "ad3af696063bbe98f2e5763619355855",
+    "semantic_hash": ""
+  },
+  "tests/test_config.py": {
+    "mtime": 1785323013.2043087,
+    "ast_hash": "765f81cff1344c21664876abb8635328",
+    "semantic_hash": ""
+  },
+  "tests/test_provider.py": {
+    "mtime": 1785323013.2051756,
+    "ast_hash": "7acde547e0423de039f4333f52078216",
+    "semantic_hash": ""
+  },
+  "PLAN.md": {
+    "mtime": 1785321426.4633493,
+    "ast_hash": "eb3040ff9c73bb3475a70315f5925df5",
+    "semantic_hash": ""
+  },
+  "README.md": {
+    "mtime": 1785321426.4691691,
+    "ast_hash": "f4b13ecaf5323da153e365eace92b2e1",
+    "semantic_hash": ""
+  },
+  "moa.yaml": {
+    "mtime": 1785323111.5829556,
+    "ast_hash": "df442ac8fe3bf8ccf5c8056f2d3e7ae9",
+    "semantic_hash": ""
+  }
+}

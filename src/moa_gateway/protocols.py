@@ -52,39 +52,65 @@ def _reject_tools(body: dict[str, Any]) -> None:
         )
 
 
-def _openai_messages(messages: Any) -> list[dict[str, str]]:
+def _openai_messages(messages: Any) -> list[dict[str, Any]]:
     if not isinstance(messages, list) or not messages:
         raise HTTPException(status_code=400, detail="messages must be a non-empty list")
-    result: list[dict[str, str]] = []
+    result: list[dict[str, Any]] = []
     for message in messages:
         if not isinstance(message, dict):
             raise HTTPException(status_code=400, detail="each message must be an object")
-        if message.get("tool_calls") or message.get("role") in {"tool", "function"}:
-            raise HTTPException(
-                status_code=501,
-                detail="tool call history is not implemented yet",
-            )
         role = message.get("role")
-        if role not in {"system", "developer", "user", "assistant"}:
+        if role not in {"system", "developer", "user", "assistant", "tool"}:
             raise HTTPException(status_code=400, detail=f"unsupported message role: {role}")
-        result.append(
-            {
-                "role": "system" if role == "developer" else role,
-                "content": _text_content(message.get("content", ""), {"text"}),
-            }
-        )
+        content = message.get("content", "")
+        if content is None and role == "assistant" and message.get("tool_calls"):
+            content = ""
+        normalized: dict[str, Any] = {
+            "role": "system" if role == "developer" else role,
+            "content": _text_content(content, {"text"}),
+        }
+        if role == "tool":
+            tool_call_id = message.get("tool_call_id")
+            if not isinstance(tool_call_id, str) or not tool_call_id:
+                raise HTTPException(status_code=400, detail="tool message needs tool_call_id")
+            normalized["tool_call_id"] = tool_call_id
+            if isinstance(message.get("name"), str):
+                normalized["name"] = message["name"]
+        if message.get("tool_calls") is not None:
+            if role != "assistant" or not isinstance(message["tool_calls"], list):
+                raise HTTPException(status_code=400, detail="invalid assistant tool_calls")
+            normalized["tool_calls"] = message["tool_calls"]
+        result.append(normalized)
     return result
+
+
+def _openai_tools(data: dict[str, Any]) -> list[dict[str, Any]]:
+    if data.get("functions"):
+        raise HTTPException(status_code=501, detail="legacy functions are unsupported")
+    tools = data.get("tools") or []
+    if not isinstance(tools, list):
+        raise HTTPException(status_code=400, detail="tools must be a list")
+    for tool in tools:
+        if (
+            not isinstance(tool, dict)
+            or tool.get("type") != "function"
+            or not isinstance(tool.get("function"), dict)
+            or not isinstance(tool["function"].get("name"), str)
+        ):
+            raise HTTPException(status_code=400, detail="invalid function tool")
+    return tools
 
 
 def parse_chat_request(body: Any) -> CanonicalRequest:
     data = _require_object(body)
-    _reject_tools(data)
     return CanonicalRequest(
         requested_model=data.get("model"),
         messages=_openai_messages(data.get("messages")),
         max_tokens=data.get("max_completion_tokens", data.get("max_tokens")),
         temperature=data.get("temperature"),
         stop=data.get("stop"),
+        tools=_openai_tools(data),
+        tool_choice=data.get("tool_choice"),
     )
 
 
@@ -181,6 +207,13 @@ def parse_responses_request(body: Any) -> CanonicalRequest:
 
 
 def chat_completion(completion: Completion, public_model: str) -> dict[str, Any]:
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": completion.content or (None if completion.tool_calls else ""),
+        "refusal": None,
+    }
+    if completion.tool_calls:
+        message["tool_calls"] = completion.tool_calls
     return {
         "id": _id("chatcmpl"),
         "object": "chat.completion",
@@ -189,11 +222,7 @@ def chat_completion(completion: Completion, public_model: str) -> dict[str, Any]
         "choices": [
             {
                 "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": completion.content,
-                    "refusal": None,
-                },
+                "message": message,
                 "finish_reason": completion.finish_reason,
                 "logprobs": None,
             }
@@ -308,6 +337,20 @@ async def chat_stream(
         }
     )
     async for item in events:
+        if item.progress:
+            yield f": moa-progress {item.progress.replace(chr(10), ' ')}\n\n"
+            continue
+        if item.error:
+            yield _sse(
+                {
+                    "error": {
+                        "type": "api_error",
+                        "code": "upstream_error",
+                        "message": item.error,
+                    }
+                }
+            )
+            return
         if item.content is not None:
             yield _sse(
                 {
@@ -319,6 +362,22 @@ async def chat_stream(
                         {
                             "index": 0,
                             "delta": {"content": item.content},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
+        if item.tool_calls:
+            yield _sse(
+                {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": public_model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"tool_calls": item.tool_calls},
                             "finish_reason": None,
                         }
                     ],
@@ -387,6 +446,18 @@ async def anthropic_stream(
         "content_block_start",
     )
     async for item in events:
+        if item.progress:
+            yield f": moa-progress {item.progress.replace(chr(10), ' ')}\n\n"
+            continue
+        if item.error:
+            yield _sse(
+                {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": item.error},
+                },
+                "error",
+            )
+            return
         if item.content is not None:
             yield _sse(
                 {
@@ -481,6 +552,23 @@ async def responses_stream(
 
     final_usage = Usage()
     async for item in events:
+        if item.progress:
+            yield f": moa-progress {item.progress.replace(chr(10), ' ')}\n\n"
+            continue
+        if item.error:
+            yield _sse(
+                {
+                    "type": "response.failed",
+                    "sequence_number": sequence,
+                    "response": {
+                        **initial,
+                        "status": "failed",
+                        "error": {"code": "upstream_error", "message": item.error},
+                    },
+                },
+                "response.failed",
+            )
+            return
         if item.content is not None:
             text += item.content
             yield _sse(

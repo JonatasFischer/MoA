@@ -1,21 +1,208 @@
 server:
   host: 127.0.0.1
-  port: 8080
+  port: 14598
   api_key_env: MOA_API_KEY
+  trace_log_path: moa-trace.jsonl
+  trace_max_bytes: 33554432
+  trace_backup_count: 3
+  warmup_on_startup: true
+  warmup_profiles:
+    - code
+  pid_file: .moa.pid
 
 providers:
   ollama:
-    type: openai-compatible
-    base_url: http://127.0.0.1:11434/v1
-    timeout_seconds: 300
+    type: ollama
+    base_url: http://127.0.0.1:11434
+    timeout_seconds: 1800
+  deepseek:
+    type: deepseek
+    timeout_seconds: 1800
 
 profiles:
+  direct:
+    aliases:
+      - claude-direct-code
+      - direct-code
+    strategy: direct
+    provider: ollama
+    model: qwen3-coder:30b-128k
+    keep_alive: 10m
+    num_ctx: 131072
+    think: false
+
   code:
     aliases:
       - claude-moa-code
       - moa-code
+    strategy: council
+    contributors:
+      - provider: ollama
+        model: qwen2.5-coder:7b
+        family: qwen
+        role: qwen complete council
+        temperature: 0.3
+        keep_alive: -1
+        num_ctx: 8192
+      - provider: ollama
+        model: gemma4:latest
+        family: gemma
+        role: gemma complete council
+        temperature: 0.4
+        keep_alive: -1
+        num_ctx: 8192
+      - provider: ollama
+        model: deepseek-coder-v2:16b
+        family: deepseek
+        role: deepseek complete council
+        temperature: 0.2
+        keep_alive: 0
+        num_ctx: 8192
+    aggregator:
+      provider: ollama
+      model: qwen3.6:27b
+      family: qwen
+      role: authoritative council aggregator
+      temperature: 0.2
+      think: false
+      keep_alive: -1
+      num_ctx: 65536
+    tool_dispatch:
+      provider: ollama
+      model: qwen3.6:27b
+      family: qwen
+      role: direct tool dispatcher
+      temperature: 0.1
+      think: false
+      keep_alive: -1
+      num_ctx: 65536
+    tool_policy: final-only
+    min_quorum: 2
+    max_concurrency: 1
+    contributor_deadline_seconds: 45
+    contributor_max_tokens: 2560
+    reference_token_budget: 6000
+    contributor_history_chars: 12000
+    contributor_format: json-schema
+    reasoning_reserve:
+      qwen: 4096
+
+  council-k2:
+    aliases:
+      - benchmark-council-k2
+    strategy: classic
+    proposers:
+      - provider: ollama
+        model: qwen2.5-coder:7b
+        role: independent implementer
+        temperature: 0.2
+        keep_alive: -1
+        num_ctx: 8192
+      - provider: ollama
+        model: gemma4:latest
+        role: independent reviewer
+        temperature: 0.2
+        keep_alive: -1
+        num_ctx: 8192
+    aggregator:
+      provider: ollama
+      model: qwen3.6:27b
+      family: qwen
+      role: benchmark synthesizer
+      temperature: 0.1
+      think: false
+      keep_alive: -1
+      num_ctx: 65536
+    min_quorum: 2
+    max_concurrency: 1
+    proposer_max_tokens: 1024
+    reference_token_budget: 6000
+    reasoning_reserve:
+      qwen: 4096
+
+  council-k3:
+    aliases:
+      - benchmark-council-k3
+    strategy: classic
+    proposers:
+      - provider: ollama
+        model: qwen2.5-coder:7b
+        role: independent implementer
+        temperature: 0.2
+        keep_alive: -1
+        num_ctx: 8192
+      - provider: ollama
+        model: gemma4:latest
+        role: independent reviewer
+        temperature: 0.2
+        keep_alive: -1
+        num_ctx: 8192
+      - provider: ollama
+        model: deepseek-coder-v2:16b
+        role: independent edge-case analyst
+        temperature: 0.2
+        keep_alive: 0
+        num_ctx: 8192
+    aggregator:
+      provider: ollama
+      model: qwen3.6:27b
+      family: qwen
+      role: benchmark synthesizer
+      temperature: 0.1
+      think: false
+      keep_alive: -1
+      num_ctx: 65536
+    min_quorum: 3
+    max_concurrency: 1
+    proposer_max_tokens: 1024
+    reference_token_budget: 6000
+    reasoning_reserve:
+      qwen: 4096
+
+  self-consistency:
+    aliases:
+      - benchmark-self-consistency
+    strategy: classic
+    proposers:
+      - provider: ollama
+        model: qwen2.5-coder:7b
+        role: independent sample one
+        temperature: 0.5
+        keep_alive: -1
+        num_ctx: 8192
+      - provider: ollama
+        model: qwen2.5-coder:7b
+        role: independent sample two
+        temperature: 0.7
+        keep_alive: -1
+        num_ctx: 8192
+      - provider: ollama
+        model: qwen2.5-coder:7b
+        role: independent sample three
+        temperature: 0.9
+        keep_alive: -1
+        num_ctx: 8192
+    aggregator:
+      provider: ollama
+      model: qwen3.6:27b
+      family: qwen
+      role: self-consistency synthesizer
+      temperature: 0.1
+      think: false
+      keep_alive: -1
+      num_ctx: 65536
+    min_quorum: 3
+    max_concurrency: 1
+    proposer_max_tokens: 1024
+    reference_token_budget: 6000
+    reasoning_reserve:
+      qwen: 4096
+
+  deepseek-direct:
+    aliases:
+      - deepseek-direct-code
     strategy: direct
-    provider: ollama
-    model: qwen2.5-coder:7b
+    provider: deepseek
+    model: deepseek-chat
 
 default_profile: code
