@@ -18,6 +18,11 @@ providers:
   deepseek:
     type: deepseek
     timeout_seconds: 1800
+  lms:
+    type: openai-compatible
+    base_url: https://llm.internal.dev.riss.space/openai
+    api_key_env: LMS_KEY
+    timeout_seconds: 1800
 
 profiles:
   direct:
@@ -59,23 +64,17 @@ profiles:
         keep_alive: 0
         num_ctx: 8192
     aggregator:
-      provider: ollama
-      model: qwen3.6:27b
+      provider: lms
+      model: Qwen/Qwen3-Coder-Next-FP8
       family: qwen
       role: authoritative council aggregator
       temperature: 0.2
-      think: false
-      keep_alive: -1
-      num_ctx: 65536
     tool_dispatch:
-      provider: ollama
-      model: qwen3.6:27b
+      provider: lms
+      model: Qwen/Qwen3-Coder-Next-FP8
       family: qwen
       role: direct tool dispatcher
       temperature: 0.1
-      think: false
-      keep_alive: -1
-      num_ctx: 65536
     tool_policy: final-only
     min_quorum: 2
     max_concurrency: 1
@@ -105,14 +104,11 @@ profiles:
         keep_alive: -1
         num_ctx: 8192
     aggregator:
-      provider: ollama
-      model: qwen3.6:27b
+      provider: lms
+      model: Qwen/Qwen3-Coder-Next-FP8
       family: qwen
       role: benchmark synthesizer
       temperature: 0.1
-      think: false
-      keep_alive: -1
-      num_ctx: 65536
     min_quorum: 2
     max_concurrency: 1
     proposer_max_tokens: 1024
@@ -144,14 +140,11 @@ profiles:
         keep_alive: 0
         num_ctx: 8192
     aggregator:
-      provider: ollama
-      model: qwen3.6:27b
+      provider: lms
+      model: Qwen/Qwen3-Coder-Next-FP8
       family: qwen
       role: benchmark synthesizer
       temperature: 0.1
-      think: false
-      keep_alive: -1
-      num_ctx: 65536
     min_quorum: 3
     max_concurrency: 1
     proposer_max_tokens: 1024
@@ -183,14 +176,11 @@ profiles:
         keep_alive: -1
         num_ctx: 8192
     aggregator:
-      provider: ollama
-      model: qwen3.6:27b
+      provider: lms
+      model: Qwen/Qwen3-Coder-Next-FP8
       family: qwen
       role: self-consistency synthesizer
       temperature: 0.1
-      think: false
-      keep_alive: -1
-      num_ctx: 65536
     min_quorum: 3
     max_concurrency: 1
     proposer_max_tokens: 1024
