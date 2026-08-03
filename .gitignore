@@ -10,5 +10,6 @@ build/
 htmlcov/
 *.log
 moa-trace.jsonl
+moa-trace.jsonl.*
 .moa.pid
 .env
