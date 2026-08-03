@@ -9,6 +9,17 @@ server:
   warmup_profiles:
     - code
   pid_file: .moa.pid
+  tool_enforcement:
+    enabled: true
+    required_tools:
+      - search_code
+      - get_symbol
+      - find_callers
+      - find_tests_for
+      - find_related
+      - get_file_outline
+      - assemble_context
+    enforcement_mode: auto
 
 providers:
   ollama:

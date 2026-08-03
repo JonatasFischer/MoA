@@ -12,6 +12,10 @@ from moa_gateway.gateway import Gateway
 from moa_gateway.provider import UpstreamError
 
 
+def is_filter_request(request: CanonicalRequest) -> bool:
+    return request.messages[0]["content"].startswith("# ROLE\n\nYou are an analysis agent.")
+
+
 class PanelProvider:
     def __init__(self, failing: set[str] | None = None) -> None:
         self.failing = failing or set()
@@ -141,13 +145,33 @@ async def test_classic_profile_collects_advice_then_aggregates() -> None:
     result = await gateway.complete(request)
 
     assert result.model == "final"
-    assert [model for model, _ in provider.requests] == ["one", "two", "final"]
-    assert provider.requests[0][1].max_tokens == 123
+    assert [model for model, _ in provider.requests] == [
+        "final",
+        "one",
+        "two",
+        "final",
+    ]
+    assert is_filter_request(provider.requests[0][1])
+    assert provider.requests[1][1].max_tokens == 123
     aggregate = provider.requests[-1][1]
     assert aggregate.max_tokens == 500
     assert "advice from one" in aggregate.messages[-1]["content"]
     assert "advice from two" in aggregate.messages[-1]["content"]
     assert "untrusted" in aggregate.messages[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_filter_failure_stops_before_querying_contributors() -> None:
+    provider = PanelProvider({"final"})
+    gateway = Gateway(classic_config(), {"local": provider})
+
+    with pytest.raises(UpstreamError, match="final failed"):
+        await gateway.complete(
+            CanonicalRequest(None, [{"role": "user", "content": "solve"}])
+        )
+
+    assert [model for model, _ in provider.requests] == ["final"]
+    assert is_filter_request(provider.requests[0][1])
 
 
 @pytest.mark.asyncio
@@ -182,7 +206,12 @@ async def test_classic_streams_only_the_final_model() -> None:
 
     assert [event.content for event in events if event.content] == ["final"]
     assert events[0].progress == "collecting contributor quorum"
-    assert [model for model, _ in provider.requests] == ["one", "two", "final"]
+    assert [model for model, _ in provider.requests] == [
+        "final",
+        "one",
+        "two",
+        "final",
+    ]
 
 
 @pytest.mark.asyncio
@@ -216,14 +245,20 @@ async def test_proposers_exclude_agent_prompt_and_tool_history() -> None:
 
     await gateway.complete(request)
 
-    proposer_request = provider.requests[0][1]
+    filter_request = provider.requests[0][1]
+    assert filter_request.tools == []
+    assert "GOAL: read" in filter_request.messages[1]["content"]
+    assert '"name":"read"' in filter_request.messages[1]["content"]
+    proposer_request = provider.requests[1][1]
     assert proposer_request.tools == []
     assert all(message["role"] != "tool" for message in proposer_request.messages)
     assert [message["role"] for message in proposer_request.messages] == [
         "system",
         "user",
+        "user",
     ]
     assert proposer_request.messages[1]["content"] == "read"
+    assert "request-filter analysis" in proposer_request.messages[2]["content"]
     aggregate_request = provider.requests[-1][1]
     assert aggregate_request.tools == request.tools
     assert aggregate_request.messages[-2]["role"] == "tool"
@@ -288,9 +323,17 @@ async def test_each_contributor_runs_full_council_before_qwen_aggregation() -> N
         )
     )
 
-    contributor_requests = provider.requests[:3]
+    filter_request = provider.requests[0]
+    contributor_requests = provider.requests[1:4]
     aggregator_request = provider.requests[-1]
 
+    assert filter_request[0] == "qwen3.6:27b"
+    assert is_filter_request(filter_request[1])
+    assert "## PHASE 1 — SEARCH" in filter_request[1].messages[0]["content"]
+    assert "## PHASE 6 — VERIFICATION AND DECISION" in filter_request[1].messages[0]["content"]
+    assert "# PROMPT B" not in filter_request[1].messages[0]["content"]
+    assert filter_request[1].think is False
+    assert filter_request[1].tools == []
     assert [model for model, _ in contributor_requests] == [
         "qwen2.5-coder:7b",
         "gemma4:latest",
@@ -299,26 +342,32 @@ async def test_each_contributor_runs_full_council_before_qwen_aggregation() -> N
     assert aggregator_request[0] == "qwen3.6:27b"
     fields = {
         "contrarian",
-        "first_principles_thinker",
-        "maintainer",
-        "outsider",
-        "executor",
+        "software_architect",
+        "clean_coder",
+        "pragmatic_engineer",
+        "engineering_manager",
     }
     for _, contribution in contributor_requests:
         prompt = contribution.messages[0]["content"]
         assert all(field in prompt for field in fields)
         assert "3-5 substantive" in prompt
+        assert "instead of reflexively agreeing" in prompt
+        assert "request-filter analysis" in contribution.messages[-1]["content"]
+        assert "advice from qwen3.6:27b" in contribution.messages[-1]["content"]
         assert contribution.max_tokens == 1536
         assert contribution.tools == []
 
     aggregate = aggregator_request[1]
     references = aggregate.messages[-1]["content"]
+    evidence = json.loads(references.split("\n", 1)[1])
+    assert evidence["request_filter"] == "advice from qwen3.6:27b"
     assert "advice from qwen2.5-coder:7b" in references
     assert "advice from gemma4:latest" in references
     assert "advice from deepseek-coder-v2:16b" in references
     assert "Compare matching perspectives" in references
-    assert "You are the Tech Lead" in aggregate.messages[0]["content"]
-    assert "unresolved trade-offs" in aggregate.messages[0]["content"]
+    assert "You are the implementing Engineer" in aggregate.messages[0]["content"]
+    assert "smallest correct implementation" in aggregate.messages[0]["content"]
+    assert "do not stop at advice or a plan" in aggregate.messages[0]["content"]
     assert aggregate.max_tokens == 4608
     assert aggregate.think is False
     assert aggregate.tools[0]["function"]["name"] == "read"
@@ -341,18 +390,21 @@ async def test_trace_records_complete_model_outputs(tmp_path) -> None:
 
     assert len(request_ids) == 1
     assert [record["stage"] for record in completed] == [
+        "filter",
         "contributor",
         "contributor",
         "contributor",
         "aggregator",
     ]
     assert [record["model"] for record in completed] == [
+        "qwen3.6:27b",
         "qwen2.5-coder:7b",
         "gemma4:latest",
         "deepseek-coder-v2:16b",
         "qwen3.6:27b",
     ]
-    assert completed[0]["content"] == "advice from qwen2.5-coder:7b"
+    assert completed[0]["content"] == "advice from qwen3.6:27b"
+    assert completed[1]["content"] == "advice from qwen2.5-coder:7b"
     assert records[-1]["event"] == "request_completed"
 
 
@@ -409,6 +461,8 @@ async def test_empty_aggregation_retries_with_double_budget() -> None:
 
         async def complete(self, model: str, request: CanonicalRequest) -> Completion:
             self.requests.append((model, request))
+            if is_filter_request(request):
+                return Completion(content="filter analysis", model=model)
             if model != "qwen3.6:27b":
                 return Completion(content=f"advice from {model}", model=model)
             self.aggregate_attempts += 1
@@ -437,7 +491,9 @@ async def test_empty_aggregation_retries_with_double_budget() -> None:
     )
 
     aggregate_requests = [
-        request for model, request in provider.requests if model == "qwen3.6:27b"
+        request
+        for model, request in provider.requests
+        if model == "qwen3.6:27b" and not is_filter_request(request)
     ]
     assert result.content == "recovered answer"
     assert [request.max_tokens for request in aggregate_requests] == [4608, 9216]
@@ -450,6 +506,8 @@ async def test_empty_aggregation_falls_back_to_best_contributor() -> None:
     class FallbackProvider(PanelProvider):
         async def complete(self, model: str, request: CanonicalRequest) -> Completion:
             self.requests.append((model, request))
+            if is_filter_request(request):
+                return Completion(content="filter analysis", model=model)
             if model == "qwen3.6:27b":
                 return Completion(content="", model=model, finish_reason="length")
             contents = {
@@ -474,7 +532,10 @@ async def test_empty_aggregation_falls_back_to_best_contributor() -> None:
 
     assert result.content == "the strongest complete contributor answer"
     assert result.model == "gemma4:latest"
-    assert sum(model == "qwen3.6:27b" for model, _ in provider.requests) == 2
+    assert sum(
+        model == "qwen3.6:27b" and not is_filter_request(request)
+        for model, request in provider.requests
+    ) == 2
 
 
 @pytest.mark.asyncio
@@ -526,7 +587,9 @@ async def test_empty_streaming_aggregation_retries_before_emitting() -> None:
 
     assert [event.content for event in events if event.content] == ["recovered stream"]
     aggregate_requests = [
-        request for model, request in provider.requests if model == "qwen3.6:27b"
+        request
+        for model, request in provider.requests
+        if model == "qwen3.6:27b" and not is_filter_request(request)
     ]
     assert [request.max_tokens for request in aggregate_requests] == [4608, 9216]
 
@@ -574,7 +637,12 @@ async def test_contributor_quorum_cancels_and_marks_absent_straggler(tmp_path) -
     evidence = json.loads(aggregate.messages[-1]["content"].split("\n", 1)[1])
     assert evidence["absent_models"] == ["deepseek-coder-v2:16b"]
     records = [json.loads(line) for line in trace_path.read_text().splitlines()]
-    completed = [record for record in records if record["event"] == "stage_completed"]
+    completed = [
+        record
+        for record in records
+        if record["event"] == "stage_completed"
+        and record["stage"] == "contributor"
+    ]
     assert completed[0]["successes"] == 2
     assert completed[0]["cancelled_models"] == ["deepseek-coder-v2:16b"]
 
@@ -589,10 +657,10 @@ async def test_structured_council_is_validated_before_aggregation() -> None:
             content = json.dumps(
                 {
                     "contrarian": "risk",
-                    "first_principles_thinker": "essentials",
-                    "maintainer": "maintenance",
-                    "outsider": "analogy",
-                    "executor": "action",
+                    "software_architect": "boundaries",
+                    "clean_coder": "readability",
+                    "pragmatic_engineer": "trade-offs",
+                    "engineering_manager": "scope",
                 }
             )
             return Completion(content=content, model=model)
@@ -607,16 +675,16 @@ async def test_structured_council_is_validated_before_aggregation() -> None:
     )
 
     assert result.content == "final"
-    for _, request in provider.requests[:3]:
+    for _, request in provider.requests[1:4]:
         assert request.response_format["required"] == [
             "contrarian",
-            "first_principles_thinker",
-            "maintainer",
-            "outsider",
-            "executor",
+            "software_architect",
+            "clean_coder",
+            "pragmatic_engineer",
+            "engineering_manager",
         ]
     evidence = json.loads(provider.requests[-1][1].messages[-1]["content"].split("\n", 1)[1])
-    assert json.loads(evidence["candidates"][0]["content"])["executor"] == "action"
+    assert json.loads(evidence["candidates"][0]["content"])["engineering_manager"] == "scope"
 
 
 @pytest.mark.asyncio
@@ -680,7 +748,7 @@ async def test_stream_and_non_stream_report_same_client_usage(tmp_path) -> None:
     final_event = next(event for event in events if event.done)
 
     assert completion.usage == final_event.usage
-    assert completion.panel_usage == Usage(input_tokens=50, output_tokens=5)
+    assert completion.panel_usage == Usage(input_tokens=70, output_tokens=7)
     for path in (complete_trace, stream_trace):
         completed = [
             json.loads(line)
@@ -693,7 +761,8 @@ async def test_stream_and_non_stream_report_same_client_usage(tmp_path) -> None:
             "total_tokens": completion.usage.total_tokens,
         }
         assert completed["usage_by_stage"]["contributor"]["input_tokens"] == 30
-        assert completed["usage_total"]["total_tokens"] == 55
+        assert completed["usage_by_stage"]["filter"]["input_tokens"] == 20
+        assert completed["usage_total"]["total_tokens"] == 77
 
 
 @pytest.mark.asyncio

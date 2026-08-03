@@ -9,13 +9,16 @@ a typed YAML configuration, CLI, health and model-discovery endpoints, and text
 translation for Anthropic Messages, OpenAI Chat Completions, and OpenAI
 Responses over native Ollama, OpenAI, and DeepSeek upstreams.
 
-The default `code` profile asks three model families to each run the complete
-five-perspective council: `qwen2.5-coder:7b`, `gemma4:latest`, and
-`deepseek-coder-v2:16b`. Each contributor returns schema-validated Contrarian,
-First Principles Thinker, Maintainer, Outsider, and Executor fields. Aggregation
-starts after two valid responses or fails at the 45-second deadline;
-`qwen3.6:27b` acts as Tech Lead, presenting each advisor's 3-5 sentence assessment
-before a final verdict that explicitly identifies unresolved trade-offs.
+The default `code` profile asks two model families to each run the complete
+five-perspective council: `gemma4:latest` and `deepseek-coder-v2:16b`. Each
+contributor returns schema-validated Contrarian,
+Software Architect, Clean Coder, Pragmatic Engineer, and Engineering Manager
+fields. Before querying them, the aggregator model runs one request-analysis filter;
+its output becomes additional untrusted context for every contributor and the final
+aggregation. Aggregation starts after two valid responses or fails at the 45-second
+deadline; the aggregator acts as the implementing Engineer, considers every
+perspective, controls scope and complexity, and proceeds with the smallest correct
+implementation instead of returning a council transcript.
 
 ## Development
 
@@ -71,8 +74,8 @@ Set `OPENAI_API_KEY` or `DEEPSEEK_API_KEY` before starting the gateway. A
 custom `base_url` or `api_key_env` can still override either default.
 
 Any profile target can select these providers. Council profiles require at
-least three contributors with distinct `family` values. Every contributor runs
-all five perspectives, and Qwen 3.6 receives every complete answer:
+least two contributors with distinct `family` values. Every contributor runs
+all five perspectives, and the aggregator receives every complete answer:
 
 ```yaml
 profiles:
@@ -80,9 +83,6 @@ profiles:
     aliases: [moa-code]
     strategy: council
     contributors:
-      - provider: ollama
-        model: qwen2.5-coder:7b
-        family: qwen
       - provider: ollama
         model: gemma4:latest
         family: gemma

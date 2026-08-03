@@ -8,6 +8,12 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+class ToolEnforcementConfig(BaseModel):
+    enabled: bool = False
+    required_tools: list[str] = Field(default_factory=list)
+    enforcement_mode: Literal["warn", "block", "auto"] = "warn"
+
+
 class ServerConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = Field(default=8080, ge=1, le=65535)
@@ -18,6 +24,7 @@ class ServerConfig(BaseModel):
     warmup_on_startup: bool = False
     warmup_profiles: list[str] = Field(default_factory=list)
     pid_file: str = ".moa.pid"
+    tool_enforcement: ToolEnforcementConfig = Field(default_factory=ToolEnforcementConfig)
 
     def api_key(self) -> str | None:
         if not self.api_key_env:
@@ -165,6 +172,11 @@ class GatewayConfig(BaseModel):
             raise ValueError(
                 f"unknown warmup profile: {sorted(unknown_warmups)[0]}"
             )
+        if self.server.tool_enforcement.enabled:
+            if not self.server.tool_enforcement.required_tools:
+                raise ValueError(
+                    "tool_enforcement.enabled requires at least one required_tool"
+                )
         return self
 
     def resolve_profile(self, model: str | None) -> tuple[str, ProfileConfig]:
