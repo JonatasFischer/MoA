@@ -276,7 +276,7 @@ def create_app(
                             },
                         },
                     }
-                    for name in enforcement.required_tools
+                    for name in enforcement.investigation_tools
                     if enforcement.enabled
                 ]
                 canonical = CanonicalRequest(

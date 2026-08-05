@@ -11,10 +11,9 @@ server:
   pid_file: .moa.pid
   tool_enforcement:
     enabled: true
-    required_tools:
+    investigation_tools:
     - task
-    enforcement_mode: auto
-    min_investigation_calls: 1
+    max_investigation_calls: 3
 providers:
   ollama:
     type: ollama
@@ -36,8 +35,8 @@ profiles:
     - claude-direct-code
     - direct-code
     strategy: direct
-    provider: ollama
-    model: qwen3-coder:30b-128k
+    provider: lms
+    model: Qwen/Qwen3-Coder-Next-FP8
     proposers: []
     contributors: []
     tool_policy: final-only

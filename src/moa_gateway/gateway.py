@@ -29,20 +29,6 @@ STROPHA_INVESTIGATION_TOOLS = (
     "stropha_rag_assemble_context",
     "stropha_rag_search_code",
 )
-TASK_INVESTIGATION_FOCI = (
-    (
-        "Architecture investigation",
-        "Focus on architecture, boundaries, data flow, configuration, and design rationale.",
-    ),
-    (
-        "Implementation investigation",
-        "Focus on exact symbols, current behavior, callers, dependencies, and analogous implementations.",
-    ),
-    (
-        "Verification investigation",
-        "Focus on tests, contracts, edge cases, regressions, operational risks, and verification commands.",
-    ),
-)
 OPENCODE_MAINTENANCE_PREFIXES = (
     "Create a new anchored summary from the conversation history.",
 )
@@ -161,8 +147,8 @@ class Gateway:
             self.trace.record(
                 "tool_enforcement_enabled",
                 "init",
-                tools=self.tool_enforcement.required_tools,
-                mode=self.tool_enforcement.enforcement_mode,
+                tools=self.tool_enforcement.investigation_tools,
+                max_investigation_calls=self.tool_enforcement.max_investigation_calls,
             )
 
     def public_model(self, request: CanonicalRequest) -> str:
@@ -244,7 +230,8 @@ class Gateway:
                     aggregator,
                     aggregate_request,
                     proposals,
-                    required_tool=self._enforced_tool(investigation_tool),
+                    request,
+                    investigation_tool=investigation_tool,
                 )
                 if profile.strategy == "council" and not result.tool_calls:
                     self._record_contributor_scores(
@@ -369,7 +356,7 @@ class Gateway:
                     request,
                     filter_usage=request_filter.usage,
                     score_contributors=profile.strategy == "council",
-                    required_tool=self._enforced_tool(investigation_tool),
+                    investigation_tool=investigation_tool,
                 ):
                     yield event
                 return
@@ -508,7 +495,7 @@ class Gateway:
         *,
         filter_usage: Usage,
         score_contributors: bool,
-        required_tool: str | None,
+        investigation_tool: str | None,
     ) -> AsyncIterator[StreamEvent]:
         attempts = [request, self._aggregation_retry_request(request)]
         aggregation_usage = Usage()
@@ -589,7 +576,7 @@ class Gateway:
                         done=event.done,
                         attempt=attempt,
                     )
-                    if required_tool:
+                    if investigation_tool:
                         buffered.append(outgoing)
                         continue
                     if visible:
@@ -655,23 +642,32 @@ class Gateway:
                 stream=True,
                 attempt=attempt,
             )
-            if required_tool:
+            if investigation_tool:
                 tool_calls = self._enforce_tool_call(
-                    request_id, tool_calls, required_tool
+                    request_id, tool_calls, investigation_tool, client_request
                 )
-                yield StreamEvent(tool_calls=tool_calls)
-                for buffered_event in buffered:
-                    if buffered_event.done:
-                        yield replace(
-                            buffered_event,
-                            content=None,
-                            tool_calls=None,
-                            finish_reason="tool_calls",
-                        )
+                investigated = any(
+                    call.get("function", {}).get("name") == investigation_tool
+                    for call in tool_calls
+                )
+                if investigated:
+                    yield StreamEvent(tool_calls=tool_calls)
+                    for buffered_event in buffered:
+                        if buffered_event.done:
+                            yield replace(
+                                buffered_event,
+                                content=None,
+                                tool_calls=None,
+                                finish_reason="tool_calls",
+                            )
+                    final_content = ""
+                    finish_reason = "tool_calls"
+                    visible = True
+                else:
+                    visible = bool(final_content.strip() or tool_calls)
+                    for buffered_event in buffered:
+                        yield buffered_event
                 buffered.clear()
-                final_content = ""
-                finish_reason = "tool_calls"
-                visible = True
             if visible:
                 if score_contributors and not tool_calls:
                     self._record_contributor_scores(
@@ -863,17 +859,17 @@ class Gateway:
         if not enforcement.enabled:
             return None
         delegated = self._is_delegated_investigation(request)
-        required_tools = (
+        investigation_tools = (
             STROPHA_INVESTIGATION_TOOLS
             if delegated
-            else tuple(enforcement.required_tools)
+            else tuple(enforcement.investigation_tools)
         )
         available = {
             str(tool.get("function", {}).get("name") or "")
             for tool in request.tools
         }
         selected = next(
-            (name for name in required_tools if name in available),
+            (name for name in investigation_tools if name in available),
             None,
         )
         if selected:
@@ -881,16 +877,14 @@ class Gateway:
                 "investigation_tool_selected",
                 request_id,
                 required_tool=selected,
-                mode=enforcement.enforcement_mode,
                 delegated=delegated,
             )
             return selected
         self.trace.record(
             "investigation_tool_unavailable",
             request_id,
-            required_tools=required_tools,
+            investigation_tools=investigation_tools,
             available_tools=sorted(name for name in available if name),
-            mode=enforcement.enforcement_mode,
             delegated=delegated,
         )
         if delegated:
@@ -900,24 +894,14 @@ class Gateway:
                 reason="delegated client did not expose Stropha tools",
             )
             return None
-        if enforcement.enforcement_mode in {"auto", "block"}:
-            raise UpstreamError(
-                400,
-                "required investigation tool is unavailable; expected one of: "
-                + ", ".join(required_tools),
-            )
         return None
-
-    def _enforced_tool(self, selected: str | None) -> str | None:
-        if self.tool_enforcement.enforcement_mode == "warn":
-            return None
-        return selected
 
     def _enforce_tool_call(
         self,
         request_id: str,
         tool_calls: list[dict[str, object]],
         required_tool: str,
+        request: CanonicalRequest,
     ) -> list[dict[str, object]]:
         complete: list[dict[str, object]] = []
         fragments: dict[int, dict[str, object]] = {}
@@ -946,12 +930,10 @@ class Gateway:
             if call.get("function", {}).get("name") == required_tool
         ]
         if matching and required_tool == "task":
-            expanded: list[dict[str, object]] = []
-            target_count = max(
-                len(matching), self.tool_enforcement.min_investigation_calls
-            )
-            for index in range(target_count):
-                source = matching[index % len(matching)]
+            grounded: list[dict[str, object]] = []
+            emitted_count = len(matching)
+            selected = matching[: self.tool_enforcement.max_investigation_calls]
+            for source in selected:
                 call = {
                     **source,
                     "function": dict(source.get("function") or {}),
@@ -965,14 +947,13 @@ class Gateway:
                     ) from exc
                 if not isinstance(arguments, dict):
                     raise UpstreamError(502, "aggregator task arguments must be an object")
-                focus_name, focus_prompt = TASK_INVESTIGATION_FOCI[
-                    index % len(TASK_INVESTIGATION_FOCI)
-                ]
-                arguments["description"] = focus_name
                 arguments["subagent_type"] = "explore"
                 prompt = str(arguments.get("prompt") or "").rstrip()
-                if focus_prompt not in prompt:
-                    prompt = f"{prompt}\n\nInvestigation focus: {focus_prompt}".lstrip()
+                investigation_request = self._investigation_request(request)
+                if investigation_request and investigation_request not in prompt:
+                    prompt = (
+                        f"Original user request:\n{investigation_request}\n\n{prompt}"
+                    ).rstrip()
                 if DELEGATED_INVESTIGATION_MARKER not in prompt:
                     prompt = (
                         prompt
@@ -990,18 +971,15 @@ class Gateway:
                 function["arguments"] = json.dumps(
                     arguments, ensure_ascii=True, separators=(",", ":")
                 )
-                if target_count > 1:
-                    call["id"] = f"{source.get('id') or 'call_investigation'}_{index + 1}"
-                    if isinstance(source.get("index"), int):
-                        call["index"] = index
-                expanded.append(call)
-            complete = [call for call in complete if call not in matching] + expanded
-            if target_count > len(matching):
+                grounded.append(call)
+            complete = [call for call in complete if call not in matching] + grounded
+            matching = grounded
+            if len(selected) < emitted_count:
                 self.trace.record(
-                    "investigation_tool_fanout",
+                    "investigation_tool_capped",
                     request_id,
-                    emitted_calls=len(matching),
-                    enforced_calls=target_count,
+                    emitted_calls=emitted_count,
+                    retained_calls=len(selected),
                 )
         if matching:
             self.trace.record(
@@ -1015,17 +993,14 @@ class Gateway:
             )
             return complete
         self.trace.record(
-            "investigation_tool_missing",
+            "investigation_tool_not_requested",
             request_id,
-            required_tool=required_tool,
+            investigation_tool=required_tool,
             emitted_tools=[
                 call.get("function", {}).get("name") for call in tool_calls
             ],
         )
-        raise UpstreamError(
-            502,
-            f"aggregator did not call required investigation tool {required_tool!r}",
-        )
+        return complete
 
     async def _collect_contributions(
         self,
@@ -1323,8 +1298,9 @@ class Gateway:
         aggregator: ModelTargetConfig,
         request: CanonicalRequest,
         proposals: list[tuple[ModelTargetConfig, Completion]],
+        client_request: CanonicalRequest,
         *,
-        required_tool: str | None,
+        investigation_tool: str | None,
     ) -> tuple[Completion, Usage]:
         started = time.perf_counter()
         self.trace.record(
@@ -1355,15 +1331,23 @@ class Gateway:
             )
             raise
         aggregation_usage = result.usage
-        if required_tool:
-            result = replace(
-                result,
-                content="",
-                finish_reason="tool_calls",
-                tool_calls=self._enforce_tool_call(
-                    request_id, result.tool_calls, required_tool
-                ),
+        if investigation_tool:
+            tool_calls = self._enforce_tool_call(
+                request_id,
+                result.tool_calls,
+                investigation_tool,
+                client_request,
             )
+            if any(
+                call.get("function", {}).get("name") == investigation_tool
+                for call in tool_calls
+            ):
+                result = replace(
+                    result,
+                    content="",
+                    finish_reason="tool_calls",
+                    tool_calls=tool_calls,
+                )
         if not self._empty_completion(result):
             self.trace.record(
                 "stage_completed",
@@ -1517,7 +1501,12 @@ class Gateway:
         completion: Completion,
     ) -> Completion:
         try:
-            value = json.loads(completion.content)
+            content = completion.content.strip()
+            if content.startswith("```") and content.endswith("```"):
+                lines = content.splitlines()
+                if len(lines) >= 3 and lines[0].strip() in {"```", "```json"}:
+                    content = "\n".join(lines[1:-1]).strip()
+            value = json.loads(content)
             if not isinstance(value, dict):
                 raise ValueError("response must be an object")
             normalized = {
@@ -1684,16 +1673,31 @@ class Gateway:
             result.append(clean)
         return list(reversed(result))
 
+    @staticmethod
+    def _investigation_request(request: CanonicalRequest) -> str:
+        return next(
+            (
+                str(message.get("content") or "").strip()
+                for message in reversed(request.messages)
+                if message.get("role") == "user"
+                and str(message.get("content") or "").strip()
+            ),
+            "",
+        )
+
     def _request_filter_request(
         self,
         profile: ProfileConfig,
         request: CanonicalRequest,
         aggregator: ModelTargetConfig,
     ) -> CanonicalRequest:
+        context_messages = self._proposal_messages(
+            request.messages, profile.contributor_history_chars
+        )
         goal = next(
             (
                 str(message.get("content") or "")
-                for message in reversed(request.messages)
+                for message in reversed(context_messages)
                 if message.get("role") == "user"
                 and str(message.get("content") or "").strip()
             ),
@@ -1713,7 +1717,7 @@ class Gateway:
             [
                 f"GOAL: {goal}",
                 "CONTEXT: "
-                + json.dumps(request.messages, ensure_ascii=True, separators=(",", ":")),
+                + json.dumps(context_messages, ensure_ascii=True, separators=(",", ":")),
                 "TOOLS: "
                 + (
                     json.dumps(tools, ensure_ascii=True, separators=(",", ":"))
@@ -1839,15 +1843,7 @@ class Gateway:
                 if request.max_tokens is not None
                 else None
             ),
-            tool_choice=(
-                {
-                    "type": "function",
-                    "function": {"name": investigation_tool},
-                }
-                if investigation_tool
-                and self.tool_enforcement.enforcement_mode == "auto"
-                else request.tool_choice
-            ),
+            tool_choice=request.tool_choice,
             think=aggregator.think,
             keep_alive=aggregator.keep_alive,
             num_ctx=aggregator.num_ctx,

@@ -74,9 +74,8 @@ async def test_config_update_applies_tool_enforcement(api) -> None:
     payload = (await client.get("/api/config")).json()["config"]
     payload["tool_enforcement"] = {
         "enabled": True,
-        "required_tools": ["task"],
-        "enforcement_mode": "auto",
-        "min_investigation_calls": 3,
+        "investigation_tools": ["task"],
+        "max_investigation_calls": 3,
     }
 
     updated = await client.put("/api/config", json=payload)
@@ -191,16 +190,15 @@ async def test_config_update_persists_when_config_path_is_set(
         payload["profiles"]["code"]["model"] = "persisted-model"
         payload["tool_enforcement"] = {
             "enabled": True,
-            "required_tools": ["task"],
-            "enforcement_mode": "block",
-            "min_investigation_calls": 2,
+            "investigation_tools": ["task"],
+            "max_investigation_calls": 2,
         }
         response = await client.put("/api/config", json=payload)
 
     assert response.status_code == 200
     assert response.json()["persisted"] is True
     assert load_config(path).profiles["code"].model == "persisted-model"
-    assert load_config(path).server.tool_enforcement.min_investigation_calls == 2
+    assert load_config(path).server.tool_enforcement.max_investigation_calls == 2
 
 
 @pytest.mark.asyncio

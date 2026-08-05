@@ -143,7 +143,7 @@ function renderCanvas() {
     const aggregator = profile.aggregator || {};
     const enforcement = state.config.tool_enforcement || {};
     const enforcementDetail = enforcement.enabled
-      ? `${enforcement.enforcement_mode} / ${(enforcement.required_tools || []).join(", ")}`
+      ? `Adaptive / up to ${enforcement.max_investigation_calls || 1} via ${(enforcement.investigation_tools || []).join(", ")}`
       : "Disabled";
     mainPath = `
       <div class="stage"><span class="stage-label">1. Route</span>${systemNodeHtml("routing", "Request routing", "Initial MoA turn")}</div>
@@ -308,7 +308,7 @@ function renderSystemInspector(container, profile, id) {
       : "Initial turns enter the MoA path. Tool results, recent assistant tool calls, delegated investigations, and OpenCode maintenance can bypass it."],
     filter: ["Request filter", `A real non-streaming call to ${aggregator.model || "the aggregator"} on ${aggregator.provider || "an unconfigured provider"}. Its analysis is appended as untrusted context to every contributor and the final aggregator.`],
     quorum: ["Parallel contribution quorum", "All configured model calls are scheduled, bounded by max_concurrency and the shared deadline. Pending calls are cancelled at the deadline; aggregation starts only when min_quorum responses succeeded."],
-    "output-gate": ["Tool-call output gate", "In block and auto modes, aggregator output is withheld until the required investigation tool call is validated. Text emitted beside that call is removed."],
+    "output-gate": ["Tool-call output gate", "When the aggregator requests an investigation, its inferred calls are grounded and capped. Text emitted beside those calls is removed."],
     response: ["Response and scoring", profile.strategy === "council" ? "Text responses score council contributors after aggregation. Tool-call responses skip scoring." : "The final model response is returned with panel usage accounted separately."],
     "dispatch-route": ["Conditional tool dispatch", "This route bypasses request filtering, contributors, and aggregation. It is selected for tool-result turns, recent assistant tool calls, delegated investigations, and OpenCode maintenance prompts."],
     "dispatch-missing": ["Tool dispatcher missing", "No direct dispatcher is configured for conditional continuation turns."],
@@ -322,21 +322,20 @@ function renderSystemInspector(container, profile, id) {
   if (id === "enforcement" || id === "output-gate") {
     container.innerHTML = `
       <h3 class="inspector-title">Tool enforcement</h3>
-      <p class="inspector-copy">Global policy used on initial non-direct aggregation turns. The preflight chooses an available required tool; the output gate validates the aggregator call.</p>
+      <p class="inspector-copy">Global policy used on initial non-direct aggregation turns. The aggregator may request only the investigations it needs, up to the configured maximum.</p>
       <label class="toggle-row"><input id="enforcement-enabled" type="checkbox" ${enforcement.enabled ? "checked" : ""}><span>Enable enforcement</span></label>
-      <div class="field"><label>Required tools, in priority order</label><input data-enforcement-field="required_tools" value="${esc((enforcement.required_tools || []).join(", "))}" placeholder="task"></div>
-      <div class="field"><label>Mode</label><select data-enforcement-field="enforcement_mode"><option value="warn" ${enforcement.enforcement_mode === "warn" ? "selected" : ""}>Warn: instruct but do not reject</option><option value="block" ${enforcement.enforcement_mode === "block" ? "selected" : ""}>Block: require emitted call</option><option value="auto" ${enforcement.enforcement_mode === "auto" ? "selected" : ""}>Auto: force named tool choice</option></select></div>
-      <div class="field"><label>Minimum delegated investigations</label><input data-enforcement-field="min_investigation_calls" type="number" min="1" max="8" value="${esc(enforcement.min_investigation_calls || 1)}"></div>
-      <p class="hint">When the required tool is task, MoA expands it into this many architecture, implementation, and verification investigations.</p>`;
+      <div class="field"><label>Investigation tools, in priority order</label><input data-enforcement-field="investigation_tools" value="${esc((enforcement.investigation_tools || []).join(", "))}" placeholder="task"></div>
+      <div class="field"><label>Maximum delegated investigations</label><input data-enforcement-field="max_investigation_calls" type="number" min="1" max="8" value="${esc(enforcement.max_investigation_calls || 1)}"></div>
+      <p class="hint">The aggregator infers zero or more distinct investigation scopes from missing information in the request. MoA never creates generic scopes.</p>`;
     $("#enforcement-enabled").addEventListener("change", (event) => {
       enforcement.enabled = event.target.checked;
-      if (enforcement.enabled && !(enforcement.required_tools || []).length) enforcement.required_tools = ["task"];
+      if (enforcement.enabled && !(enforcement.investigation_tools || []).length) enforcement.investigation_tools = ["task"];
       markDirty(); render();
     });
     container.querySelectorAll("[data-enforcement-field]").forEach((input) => input.addEventListener("input", () => {
       const field = input.dataset.enforcementField;
-      if (field === "required_tools") enforcement[field] = input.value.split(",").map((tool) => tool.trim()).filter(Boolean);
-      else if (field === "min_investigation_calls") enforcement[field] = Number(input.value);
+      if (field === "investigation_tools") enforcement[field] = input.value.split(",").map((tool) => tool.trim()).filter(Boolean);
+      else if (field === "max_investigation_calls") enforcement[field] = Number(input.value);
       else enforcement[field] = input.value;
       markDirty();
     }));

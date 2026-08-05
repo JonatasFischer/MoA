@@ -10,9 +10,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 class ToolEnforcementConfig(BaseModel):
     enabled: bool = False
-    required_tools: list[str] = Field(default_factory=list)
-    enforcement_mode: Literal["warn", "block", "auto"] = "warn"
-    min_investigation_calls: int = Field(default=1, ge=1, le=8)
+    investigation_tools: list[str] = Field(default_factory=list)
+    max_investigation_calls: int = Field(default=1, ge=1, le=8)
 
 
 class ServerConfig(BaseModel):
@@ -174,9 +173,9 @@ class GatewayConfig(BaseModel):
                 f"unknown warmup profile: {sorted(unknown_warmups)[0]}"
             )
         if self.server.tool_enforcement.enabled:
-            if not self.server.tool_enforcement.required_tools:
+            if not self.server.tool_enforcement.investigation_tools:
                 raise ValueError(
-                    "tool_enforcement.enabled requires at least one required_tool"
+                    "tool_enforcement.enabled requires at least one investigation_tool"
                 )
         return self
 

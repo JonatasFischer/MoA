@@ -13,7 +13,9 @@ from moa_gateway.provider import UpstreamError
 
 
 def is_filter_request(request: CanonicalRequest) -> bool:
-    return request.messages[0]["content"].startswith("# ROLE\n\nYou are an analysis agent.")
+    return request.messages[0]["content"].startswith(
+        "# ROLE\n\nYou are a request assessment agent."
+    )
 
 
 class PanelProvider:
@@ -73,8 +75,16 @@ STROPHA_TOOL = {
 class TaskProvider(PanelProvider):
     async def complete(self, model: str, request: CanonicalRequest) -> Completion:
         self.requests.append((model, request))
-        if isinstance(request.tool_choice, dict):
-            selected = request.tool_choice["function"]["name"]
+        adaptive_investigation = (
+            "# ADAPTIVE PRIVATE INVESTIGATION"
+            in str(request.messages[0].get("content") or "")
+        )
+        if isinstance(request.tool_choice, dict) or adaptive_investigation:
+            selected = (
+                request.tool_choice["function"]["name"]
+                if isinstance(request.tool_choice, dict)
+                else "task"
+            )
             tool_call = (
                 TASK_CALL
                 if selected == "task"
@@ -219,13 +229,12 @@ def council_config(
     )
 
 
-def enforced_council_config() -> GatewayConfig:
+def enforced_council_config(max_investigation_calls: int = 3) -> GatewayConfig:
     return council_config(
         tool_enforcement={
             "enabled": True,
-            "required_tools": ["task"],
-            "enforcement_mode": "auto",
-            "min_investigation_calls": 3,
+            "investigation_tools": ["task"],
+            "max_investigation_calls": max_investigation_calls,
         }
     )
 
@@ -402,7 +411,7 @@ async def test_tool_result_turn_routes_directly_without_council() -> None:
 
 
 @pytest.mark.asyncio
-async def test_auto_enforcement_forces_private_task_investigation() -> None:
+async def test_auto_enforcement_allows_private_task_investigation() -> None:
     provider = TaskProvider()
     gateway = Gateway(enforced_council_config(), {"local": provider})
 
@@ -416,43 +425,106 @@ async def test_auto_enforcement_forces_private_task_investigation() -> None:
     )
 
     aggregate = provider.requests[-1][1]
-    assert aggregate.tool_choice == {
-        "type": "function",
-        "function": {"name": "task"},
-    }
+    assert aggregate.tool_choice == "auto"
     assert "use Stropha" in aggregate.messages[0]["content"]
-    assert "multiple independent" in aggregate.messages[0]["content"]
+    assert "up to" in aggregate.messages[0]["content"]
+    assert "predetermined scopes" in aggregate.messages[0]["content"]
     assert result.content == ""
-    assert len(result.tool_calls) == 3
+    assert len(result.tool_calls) == 1
     assert {call["function"]["name"] for call in result.tool_calls} == {"task"}
     arguments = [
         json.loads(call["function"]["arguments"]) for call in result.tool_calls
     ]
     assert {item["subagent_type"] for item in arguments} == {"explore"}
+    assert all(
+        "Original user request:\nchange the scheduler" in item["prompt"]
+        for item in arguments
+    )
     assert all("Stropha" in item["prompt"] for item in arguments)
     assert {item["description"] for item in arguments} == {
-        "Architecture investigation",
-        "Implementation investigation",
-        "Verification investigation",
+        "Investigate implementation"
     }
     assert result.finish_reason == "tool_calls"
 
 
 @pytest.mark.asyncio
-async def test_enforcement_rejects_request_without_investigation_tool() -> None:
+async def test_single_investigation_preserves_inferred_focus() -> None:
+    provider = TaskProvider()
+    gateway = Gateway(enforced_council_config(1), {"local": provider})
+
+    result = await gateway.complete(
+        CanonicalRequest(
+            "moa-code",
+            [{"role": "user", "content": "fix billing retry behavior"}],
+            tools=[TASK_TOOL],
+            tool_choice="auto",
+        )
+    )
+
+    assert len(result.tool_calls) == 1
+    arguments = json.loads(result.tool_calls[0]["function"]["arguments"])
+    assert arguments["description"] == "Investigate implementation"
+    assert arguments["prompt"].startswith(
+        "Original user request:\nfix billing retry behavior"
+    )
+    assert "Investigation focus:" not in arguments["prompt"]
+
+
+def test_investigation_calls_preserve_inferred_scopes_and_respect_maximum() -> None:
+    gateway = Gateway(enforced_council_config(3), {"local": PanelProvider()})
+    calls = [
+        {
+            "id": f"call_{index}",
+            "type": "function",
+            "function": {
+                "name": "task",
+                "arguments": json.dumps(
+                    {
+                        "description": f"Missing fact {index}",
+                        "prompt": f"Investigate missing fact {index}",
+                    }
+                ),
+            },
+        }
+        for index in range(4)
+    ]
+
+    result = gateway._enforce_tool_call(
+        "request",
+        calls,
+        "task",
+        CanonicalRequest(
+            "moa-code",
+            [{"role": "user", "content": "diagnose checkout failures"}],
+        ),
+    )
+
+    assert len(result) == 3
+    arguments = [json.loads(call["function"]["arguments"]) for call in result]
+    assert [item["description"] for item in arguments] == [
+        "Missing fact 0",
+        "Missing fact 1",
+        "Missing fact 2",
+    ]
+    assert all("diagnose checkout failures" in item["prompt"] for item in arguments)
+    assert all("Investigation focus:" not in item["prompt"] for item in arguments)
+
+
+@pytest.mark.asyncio
+async def test_enforcement_continues_without_investigation_tool() -> None:
     provider = PanelProvider()
     gateway = Gateway(enforced_council_config(), {"local": provider})
 
-    with pytest.raises(UpstreamError, match="required investigation tool"):
-        await gateway.complete(
-            CanonicalRequest(
-                "moa-code",
-                [{"role": "user", "content": "change the scheduler"}],
-                tools=[],
-            )
+    result = await gateway.complete(
+        CanonicalRequest(
+            "moa-code",
+            [{"role": "user", "content": "change the scheduler"}],
+            tools=[],
         )
+    )
 
-    assert provider.requests == []
+    assert result.content == "advice from qwen3.6:27b"
+    assert provider.requests
 
 
 @pytest.mark.asyncio
@@ -502,18 +574,20 @@ async def test_opencode_summary_stream_routes_directly() -> None:
 
 
 @pytest.mark.asyncio
-async def test_enforcement_rejects_aggregator_that_skips_investigation() -> None:
+async def test_enforcement_accepts_aggregator_that_needs_no_investigation() -> None:
     provider = PanelProvider()
     gateway = Gateway(enforced_council_config(), {"local": provider})
 
-    with pytest.raises(UpstreamError, match="did not call required investigation"):
-        await gateway.complete(
-            CanonicalRequest(
-                "moa-code",
-                [{"role": "user", "content": "change the scheduler"}],
-                tools=[TASK_TOOL],
-            )
+    result = await gateway.complete(
+        CanonicalRequest(
+            "moa-code",
+            [{"role": "user", "content": "explain the supplied implementation"}],
+            tools=[TASK_TOOL],
         )
+    )
+
+    assert result.content == "advice from qwen3.6:27b"
+    assert result.tool_calls == []
 
 
 @pytest.mark.asyncio
@@ -550,10 +624,13 @@ async def test_enforcement_adds_stropha_to_ungrounded_task() -> None:
         )
     )
 
-    assert len(result.tool_calls) == 3
+    assert len(result.tool_calls) == 1
     for call in result.tool_calls:
         arguments = json.loads(call["function"]["arguments"])
-        assert arguments["prompt"].startswith("Inspect the code")
+        assert arguments["prompt"].startswith(
+            "Original user request:\nchange the scheduler"
+        )
+        assert "Inspect the code" in arguments["prompt"]
         assert "use Stropha" in arguments["prompt"]
         assert arguments["subagent_type"] == "explore"
 
@@ -659,7 +736,7 @@ async def test_stream_hides_text_until_private_investigation_returns() -> None:
 
     assert all(event.content != "private pre-investigation thought" for event in events)
     calls = [call for event in events for call in (event.tool_calls or [])]
-    assert len(calls) == 3
+    assert len(calls) == 1
     assert {call["function"]["name"] for call in calls} == {"task"}
     assert all("Stropha" in call["function"]["arguments"] for call in calls)
     assert events[-1].done is True
@@ -692,8 +769,9 @@ async def test_each_contributor_runs_full_council_before_qwen_aggregation() -> N
 
     assert filter_request[0] == "qwen3.6:27b"
     assert is_filter_request(filter_request[1])
-    assert "## PHASE 1 — SEARCH" in filter_request[1].messages[0]["content"]
-    assert "## PHASE 6 — VERIFICATION AND DECISION" in filter_request[1].messages[0]["content"]
+    assert "## AVAILABLE EVIDENCE" in filter_request[1].messages[0]["content"]
+    assert "## INVESTIGATION GUIDANCE" in filter_request[1].messages[0]["content"]
+    assert "Never claim to search" in filter_request[1].messages[0]["content"]
     assert "# PROMPT B" not in filter_request[1].messages[0]["content"]
     assert filter_request[1].think is False
     assert filter_request[1].tools == []
@@ -735,6 +813,32 @@ async def test_each_contributor_runs_full_council_before_qwen_aggregation() -> N
     assert aggregate.think is False
     assert aggregate.tools[0]["function"]["name"] == "read"
     assert aggregate.tool_choice == "auto"
+
+
+@pytest.mark.asyncio
+async def test_request_filter_respects_history_character_budget() -> None:
+    config = council_config()
+    config.profiles["code"].contributor_history_chars = 24
+    provider = PanelProvider()
+    gateway = Gateway(config, {"local": provider})
+
+    await gateway.complete(
+        CanonicalRequest(
+            "moa-code",
+            [
+                {"role": "user", "content": "old context " * 20},
+                {"role": "assistant", "content": "old answer " * 20},
+                {"role": "user", "content": "current request"},
+            ],
+        )
+    )
+
+    filter_input = provider.requests[0][1].messages[1]["content"]
+    context = filter_input.split("CONTEXT: ", 1)[1].split("\nTOOLS: ", 1)[0]
+    messages = json.loads(context)
+    assert sum(len(message["content"]) for message in messages) <= 24
+    assert "current request" in context
+    assert "old context" not in context
 
 
 @pytest.mark.asyncio
@@ -1017,7 +1121,7 @@ async def test_structured_council_is_validated_before_aggregation() -> None:
             self.requests.append((model, request))
             if model == "qwen3.6:27b":
                 return Completion(content="final", model=model)
-            content = json.dumps(
+            content = "```json\n" + json.dumps(
                 {
                     "contrarian": "risk",
                     "software_architect": "boundaries",
@@ -1025,7 +1129,7 @@ async def test_structured_council_is_validated_before_aggregation() -> None:
                     "pragmatic_engineer": "trade-offs",
                     "engineering_manager": "scope",
                 }
-            )
+            ) + "\n```"
             return Completion(content=content, model=model)
 
     provider = StructuredProvider()
