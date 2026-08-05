@@ -1,107 +1,52 @@
-# Stropha MCP Tool Enforcement Implementation
+# Private Investigation Enforcement
 
-## Summary
+MoA keeps tool authority with the aggregator. Request filters and contributors
+remain private advisory model calls and do not receive client tool definitions.
 
-This implementation enforces the usage of Stropha MCP tools throughout the MoA Gateway for all codebase-related queries.
+For the bundled `code` profile, `server.tool_enforcement` requires OpenCode's
+`task` tool on the initial aggregation turn:
 
-## Changes Made
-
-### 1. New Module: `src/moa_gateway/tool_enforcement.py`
-
-Created a new module that provides:
-- `ToolEnforcementConfig` dataclass for configuration
-- `get_stropha_enforcement_prompt()` - General enforcement instructions
-- `get_request_filter_enforcement()` - Enforcement for request filter phase
-- `get_contributor_enforcement()` - Enforcement for contributor council members
-- `get_aggregator_enforcement()` - Enforcement for aggregator
-- `get_enforcement_summary()` - Human-readable summary
-
-### 2. Updated `src/moa_gateway/config.py`
-
-- Added `ToolEnforcementConfig` model
-- Added `tool_enforcement` field to `ServerConfig`
-- Added validation to ensure `required_tools` is populated when enforcement is enabled
-
-### 3. Updated `src/moa_gateway/gateway.py`
-
-- Imported tool enforcement functions
-- Added `tool_enforcement` attribute to `Gateway` class
-- Modified `_request_filter_request()` to include enforcement instructions
-- Modified `_collect_contributions()` to include enforcement instructions in contributor prompts
-- Modified `_aggregation_request()` (changed from static to instance method) to include enforcement instructions
-- Added enforcement summary to trace logs on initialization
-
-### 4. Updated `moa.yaml`
-
-Added tool enforcement configuration:
 ```yaml
 server:
   tool_enforcement:
     enabled: true
-    required_tools:
-      - search_code
-      - get_symbol
-      - find_callers
-      - find_tests_for
-      - find_related
-      - get_file_outline
-      - assemble_context
+    required_tools: [task]
     enforcement_mode: auto
+    min_investigation_calls: 3
 ```
 
-## How It Works
+The aggregator is instructed to launch independent research-only tasks, require
+those investigators to use Stropha, and request concise conclusions with source
+anchors, callers, tests, and unresolved gaps. MoA does not execute the tool. It
+returns the validated call to OpenCode, which runs the private investigator and
+adds only its final result to the conversation.
 
-### Request Filter Phase
-The request filter receives mandatory Stropha usage instructions in its system prompt, requiring it to use Stropha tools for all codebase exploration during its 6-phase analysis.
+MoA normalizes delegated calls to use OpenCode's read-only `explore` subagent,
+adds the Stropha contract when the model omits it, and expands a single call into
+the configured minimum parallel investigations. The bundled configuration uses
+architecture, implementation/callers, and verification/risks focuses. When each
+delegated request enters MoA, the contract marker switches enforcement from
+`task` to the first available Stropha investigation tool. This prevents recursive
+task delegation while still keeping every tool execution in OpenCode.
 
-### Contributor Phase
-Each contributor (council member) receives enforcement instructions that require them to:
-- Use Stropha tools for semantic understanding
-- Use `get_symbol` for exact symbol lookups
-- Use `find_callers` to understand impact and usage
-- Use `find_tests_for` to identify test coverage
-- Reference specific tool results with file:line anchors
-
-### Aggregator Phase
-The aggregator receives enforcement instructions that require it to:
-- Use Stropha tools to validate contributor claims
-- Cross-validate conflicting claims
-- Reference specific Stropha tool results
-- Identify gaps that Stropha tools should have filled
+Some OpenCode subagent configurations expose only basic `glob`/`grep`/`read`
+tools. A delegated request falls back to those available research tools when no
+Stropha tool is present; it is traced as a degraded investigation instead of
+failing the entire parent session.
 
 ## Enforcement Modes
 
-- **warn**: Informs users they must use Stropha tools
-- **block**: Indicates responses will be rejected without Stropha usage
-- **auto**: States Stropha usage is required for all codebase queries
+- `warn`: add the delegation instruction when a configured tool is available.
+- `block`: require a configured tool call and reject a response that omits it.
+- `auto`: force the first available configured tool with named `tool_choice` and
+  reject a response that omits it.
 
-## Testing
+For `block` and `auto`, MoA rejects the request before running the filter or
+contributors when none of the configured tools is available. During streaming,
+the aggregator response is buffered until the required call is validated. Text
+emitted alongside that call is discarded so provisional reasoning does not leak
+to the coding agent.
 
-All 65 tests pass, including:
-- API tests
-- Benchmark tests
-- CLI tests
-- Config validation tests
-- Gateway logic tests
-- Provider tests
-- Tool tests
-- Trace tests
-
-## Configuration
-
-To enable/disable tool enforcement, modify `moa.yaml`:
-
-```yaml
-server:
-  tool_enforcement:
-    enabled: false  # or true
-    required_tools: [search_code, get_symbol, ...]
-    enforcement_mode: warn|block|auto
-```
-
-## Benefits
-
-1. **Consistent Codebase Exploration**: All agents use Stropha's semantic search
-2. **Better Context**: Stropha provides deeper understanding than text search
-3. **Traceability**: Tool results include file:line anchors for verification
-4. **Comprehensive Coverage**: Ensures all aspects (callers, tests, related code) are explored
+Tool-result turns continue through the configured direct tool dispatcher. This
+avoids recursively running another council while the aggregator consumes the
+private investigator's conclusion.

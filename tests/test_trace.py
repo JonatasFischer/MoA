@@ -32,3 +32,17 @@ def test_trace_truncates_single_oversized_record(tmp_path) -> None:
     assert record["truncated"] is True
     assert record["messages"] == "<truncated>"
     assert path.stat().st_size <= 1024
+
+
+def test_trace_subscribers_receive_events_without_a_log_path() -> None:
+    recorder = TraceRecorder(None)
+    events: list[dict] = []
+    subscriber = events.append
+    recorder.subscribe("request", subscriber)
+
+    recorder.record("stage_started", "request", stage="filter")
+    recorder.unsubscribe("request", subscriber)
+    recorder.record("stage_completed", "request", stage="filter")
+
+    assert [event["event"] for event in events] == ["stage_started"]
+    assert events[0]["stage"] == "filter"

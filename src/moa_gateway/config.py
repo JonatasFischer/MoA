@@ -12,6 +12,7 @@ class ToolEnforcementConfig(BaseModel):
     enabled: bool = False
     required_tools: list[str] = Field(default_factory=list)
     enforcement_mode: Literal["warn", "block", "auto"] = "warn"
+    min_investigation_calls: int = Field(default=1, ge=1, le=8)
 
 
 class ServerConfig(BaseModel):
@@ -187,6 +188,27 @@ class GatewayConfig(BaseModel):
             if requested in profile.aliases:
                 return name, profile
         raise KeyError(requested)
+
+
+class ExperimentConfig(BaseModel):
+    providers: dict[str, ProviderConfig]
+    profiles: dict[str, ProfileConfig]
+    default_profile: str
+    tool_enforcement: ToolEnforcementConfig = Field(
+        default_factory=ToolEnforcementConfig
+    )
+
+    @classmethod
+    def from_gateway(cls, config: GatewayConfig) -> "ExperimentConfig":
+        return cls.model_validate(
+            {
+                **config.model_dump(
+                    include={"providers", "profiles", "default_profile"},
+                    by_alias=True,
+                ),
+                "tool_enforcement": config.server.tool_enforcement.model_dump(),
+            }
+        )
 
 
 def load_config(path: str | Path | None = None) -> GatewayConfig:

@@ -89,7 +89,9 @@ def _pid_path(config_path: Path, configured: str) -> Path:
     return path if path.is_absolute() else config_path.parent / path
 
 
-def _serve(config, pid_path: Path) -> None:
+def _serve(
+    config, pid_path: Path, config_path: Path | None = None
+) -> None:
     family = socket.AF_INET6 if ":" in config.server.host else socket.AF_INET
     sock = socket.socket(family, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -115,7 +117,7 @@ def _serve(config, pid_path: Path) -> None:
     try:
         server = uvicorn.Server(
             uvicorn.Config(
-                create_app(config),
+                create_app(config, config_path=config_path),
                 host=config.server.host,
                 port=config.server.port,
             )
@@ -184,7 +186,7 @@ def main() -> None:
         return
 
     if args.command == "serve":
-        _serve(config, _pid_path(path, config.server.pid_file))
+        _serve(config, _pid_path(path, config.server.pid_file), path)
         return
 
 

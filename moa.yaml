@@ -7,203 +7,232 @@ server:
   trace_backup_count: 3
   warmup_on_startup: true
   warmup_profiles:
-    - code
+  - code
   pid_file: .moa.pid
   tool_enforcement:
     enabled: true
     required_tools:
-      - search_code
-      - get_symbol
-      - find_callers
-      - find_tests_for
-      - find_related
-      - get_file_outline
-      - assemble_context
+    - task
     enforcement_mode: auto
-
+    min_investigation_calls: 1
 providers:
   ollama:
     type: ollama
     base_url: http://127.0.0.1:11434
-    timeout_seconds: 1800
+    timeout_seconds: 1800.0
   deepseek:
     type: deepseek
-    timeout_seconds: 1800
+    base_url: https://api.deepseek.com
+    api_key_env: DEEPSEEK_API_KEY
+    timeout_seconds: 1800.0
   lms:
     type: openai-compatible
     base_url: https://llm.internal.dev.riss.space/openai
     api_key_env: LMS_KEY
-    timeout_seconds: 1800
-
+    timeout_seconds: 1800.0
 profiles:
   direct:
     aliases:
-      - claude-direct-code
-      - direct-code
+    - claude-direct-code
+    - direct-code
     strategy: direct
     provider: ollama
     model: qwen3-coder:30b-128k
+    proposers: []
+    contributors: []
+    tool_policy: final-only
+    min_quorum: 1
+    max_concurrency: 2
+    proposer_max_tokens: 1024
+    contributor_max_tokens: 1536
+    reference_token_budget: 8000
+    reasoning_reserve: {}
+    contributor_history_chars: 12000
+    contributor_format: text
     keep_alive: 10m
     num_ctx: 131072
     think: false
-
   code:
     aliases:
-      - claude-moa-code
-      - moa-code
+    - claude-moa-code
+    - moa-code
     strategy: council
+    proposers: []
     contributors:
-      - provider: ollama
-        model: qwen2.5-coder:7b
-        family: qwen
-        role: qwen complete council
-        temperature: 0.3
-        keep_alive: -1
-        num_ctx: 8192
-      - provider: ollama
-        model: gemma4:latest
-        family: gemma
-        role: gemma complete council
-        temperature: 0.4
-        keep_alive: -1
-        num_ctx: 8192
-      - provider: ollama
-        model: deepseek-coder-v2:16b
-        family: deepseek
-        role: deepseek complete council
-        temperature: 0.2
-        keep_alive: -1
-        num_ctx: 8192
+    - provider: lms
+      model: Qwen/Qwen3-Coder-Next-FP8
+      role: qwen complete council
+      family: qwen
+      temperature: 0.3
+      keep_alive: -1
+      num_ctx: 8192
+    - provider: lms
+      model: Qwen/Qwen3-Coder-Next-FP8
+      role: gemma complete council
+      family: gemma
+      temperature: 0.4
+      keep_alive: -1
+      num_ctx: 8192
+    - provider: lms
+      model: Qwen/Qwen3-Coder-Next-FP8
+      role: deepseek complete council
+      family: deepseek
+      temperature: 0.2
+      keep_alive: -1
+      num_ctx: 8192
     aggregator:
       provider: lms
       model: Qwen/Qwen3-Coder-Next-FP8
-      family: qwen
       role: authoritative council aggregator
+      family: qwen
       temperature: 0.2
+      think: true
     tool_dispatch:
       provider: lms
       model: Qwen/Qwen3-Coder-Next-FP8
-      family: qwen
       role: direct tool dispatcher
+      family: qwen
       temperature: 0.1
     tool_policy: final-only
     min_quorum: 2
     max_concurrency: 3
-    contributor_deadline_seconds: 45
+    contributor_deadline_seconds: 45.0
+    proposer_max_tokens: 1024
     contributor_max_tokens: 2560
     reference_token_budget: 6000
-    contributor_history_chars: 12000
-    contributor_format: json-schema
     reasoning_reserve:
       qwen: 4096
-
+    contributor_history_chars: 12000
+    contributor_format: json-schema
   council-k2:
     aliases:
-      - benchmark-council-k2
+    - benchmark-council-k2
     strategy: classic
     proposers:
-      - provider: ollama
-        model: qwen2.5-coder:7b
-        role: independent implementer
-        temperature: 0.2
-        keep_alive: -1
-        num_ctx: 8192
-      - provider: ollama
-        model: gemma4:latest
-        role: independent reviewer
-        temperature: 0.2
-        keep_alive: -1
-        num_ctx: 8192
+    - provider: ollama
+      model: qwen2.5-coder:7b
+      role: independent implementer
+      temperature: 0.2
+      keep_alive: -1
+      num_ctx: 8192
+    - provider: ollama
+      model: gemma4:latest
+      role: independent reviewer
+      temperature: 0.2
+      keep_alive: -1
+      num_ctx: 8192
+    contributors: []
     aggregator:
       provider: lms
       model: Qwen/Qwen3-Coder-Next-FP8
-      family: qwen
       role: benchmark synthesizer
+      family: qwen
       temperature: 0.1
+    tool_policy: final-only
     min_quorum: 2
     max_concurrency: 1
     proposer_max_tokens: 1024
+    contributor_max_tokens: 1536
     reference_token_budget: 6000
     reasoning_reserve:
       qwen: 4096
-
+    contributor_history_chars: 12000
+    contributor_format: text
   council-k3:
     aliases:
-      - benchmark-council-k3
+    - benchmark-council-k3
     strategy: classic
     proposers:
-      - provider: ollama
-        model: qwen2.5-coder:7b
-        role: independent implementer
-        temperature: 0.2
-        keep_alive: -1
-        num_ctx: 8192
-      - provider: ollama
-        model: gemma4:latest
-        role: independent reviewer
-        temperature: 0.2
-        keep_alive: -1
-        num_ctx: 8192
-      - provider: ollama
-        model: deepseek-coder-v2:16b
-        role: independent edge-case analyst
-        temperature: 0.2
-        keep_alive: 0
-        num_ctx: 8192
+    - provider: ollama
+      model: qwen2.5-coder:7b
+      role: independent implementer
+      temperature: 0.2
+      keep_alive: -1
+      num_ctx: 8192
+    - provider: ollama
+      model: gemma4:latest
+      role: independent reviewer
+      temperature: 0.2
+      keep_alive: -1
+      num_ctx: 8192
+    - provider: ollama
+      model: deepseek-coder-v2:16b
+      role: independent edge-case analyst
+      temperature: 0.2
+      keep_alive: 0
+      num_ctx: 8192
+    contributors: []
     aggregator:
       provider: lms
       model: Qwen/Qwen3-Coder-Next-FP8
-      family: qwen
       role: benchmark synthesizer
+      family: qwen
       temperature: 0.1
+    tool_policy: final-only
     min_quorum: 3
     max_concurrency: 1
     proposer_max_tokens: 1024
+    contributor_max_tokens: 1536
     reference_token_budget: 6000
     reasoning_reserve:
       qwen: 4096
-
+    contributor_history_chars: 12000
+    contributor_format: text
   self-consistency:
     aliases:
-      - benchmark-self-consistency
+    - benchmark-self-consistency
     strategy: classic
     proposers:
-      - provider: ollama
-        model: qwen2.5-coder:7b
-        role: independent sample one
-        temperature: 0.5
-        keep_alive: -1
-        num_ctx: 8192
-      - provider: ollama
-        model: qwen2.5-coder:7b
-        role: independent sample two
-        temperature: 0.7
-        keep_alive: -1
-        num_ctx: 8192
-      - provider: ollama
-        model: qwen2.5-coder:7b
-        role: independent sample three
-        temperature: 0.9
-        keep_alive: -1
-        num_ctx: 8192
+    - provider: ollama
+      model: qwen2.5-coder:7b
+      role: independent sample one
+      temperature: 0.5
+      keep_alive: -1
+      num_ctx: 8192
+    - provider: ollama
+      model: qwen2.5-coder:7b
+      role: independent sample two
+      temperature: 0.7
+      keep_alive: -1
+      num_ctx: 8192
+    - provider: ollama
+      model: qwen2.5-coder:7b
+      role: independent sample three
+      temperature: 0.9
+      keep_alive: -1
+      num_ctx: 8192
+    contributors: []
     aggregator:
       provider: lms
       model: Qwen/Qwen3-Coder-Next-FP8
-      family: qwen
       role: self-consistency synthesizer
+      family: qwen
       temperature: 0.1
+    tool_policy: final-only
     min_quorum: 3
     max_concurrency: 1
     proposer_max_tokens: 1024
+    contributor_max_tokens: 1536
     reference_token_budget: 6000
     reasoning_reserve:
       qwen: 4096
-
+    contributor_history_chars: 12000
+    contributor_format: text
   deepseek-direct:
     aliases:
-      - deepseek-direct-code
+    - deepseek-direct-code
     strategy: direct
     provider: deepseek
     model: deepseek-chat
-
+    proposers: []
+    contributors: []
+    tool_policy: final-only
+    min_quorum: 1
+    max_concurrency: 2
+    proposer_max_tokens: 1024
+    contributor_max_tokens: 1536
+    reference_token_budget: 8000
+    reasoning_reserve: {}
+    contributor_history_chars: 12000
+    contributor_format: text
 default_profile: code

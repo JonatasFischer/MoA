@@ -14,6 +14,7 @@ from moa_gateway.provider import (
     OllamaProvider,
     UpstreamError,
     create_provider,
+    discover_models,
 )
 
 
@@ -158,6 +159,56 @@ async def test_named_provider_adapters(
     assert isinstance(provider, provider_class)
     assert provider.client.headers["authorization"] == "Bearer secret"
     await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "response_body", "expected_path", "expected_models"),
+    [
+        (
+            "ollama",
+            {"models": [{"name": "qwen"}, {"name": "gemma"}]},
+            "/api/tags",
+            ["gemma", "qwen"],
+        ),
+        (
+            "openai-compatible",
+            {"data": [{"id": "gpt-b"}, {"id": "gpt-a"}]},
+            "/v1/models",
+            ["gpt-a", "gpt-b"],
+        ),
+    ],
+)
+async def test_discover_models(
+    monkeypatch, kind, response_body, expected_path, expected_models
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=response_body)
+
+    async_client = httpx.AsyncClient
+
+    def client_factory(**kwargs):
+        return async_client(**kwargs, transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr("moa_gateway.provider.httpx.AsyncClient", client_factory)
+    config = ProviderConfig.model_validate(
+        {
+            "type": kind,
+            "base_url": (
+                "http://provider.test"
+                if kind == "ollama"
+                else "http://provider.test/v1"
+            ),
+        }
+    )
+
+    models = await discover_models(config)
+
+    assert models == expected_models
+    assert requests[0].url.path == expected_path
 
 
 @pytest.mark.asyncio

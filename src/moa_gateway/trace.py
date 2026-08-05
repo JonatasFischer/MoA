@@ -4,7 +4,7 @@ import json
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 class TraceRecorder:
@@ -20,11 +20,14 @@ class TraceRecorder:
         self.backup_count = backup_count
         self._lock = threading.Lock()
         self._parents: dict[str, str] = {}
+        self._subscribers: dict[
+            str, set[Callable[[dict[str, Any]], None]]
+        ] = {}
         if self.path:
             self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def record(self, event: str, request_id: str, **fields: Any) -> None:
-        if not self.path:
+        if not self.path and request_id not in self._subscribers:
             return
         payload = {
             "timestamp": datetime.now(UTC).isoformat(),
@@ -34,6 +37,13 @@ class TraceRecorder:
         }
         if parent_request_id := self._parents.get(request_id):
             payload["parent_request_id"] = parent_request_id
+        for subscriber in tuple(self._subscribers.get(request_id, ())):
+            try:
+                subscriber(dict(payload))
+            except Exception:
+                continue
+        if not self.path:
+            return
         line = self._bounded_line(payload)
         line_bytes = len((line + "\n").encode("utf-8"))
         with self._lock:
@@ -47,6 +57,25 @@ class TraceRecorder:
                 trace.write(line + "\n")
             finally:
                 trace.close()
+
+    def subscribe(
+        self,
+        request_id: str,
+        subscriber: Callable[[dict[str, Any]], None],
+    ) -> None:
+        self._subscribers.setdefault(request_id, set()).add(subscriber)
+
+    def unsubscribe(
+        self,
+        request_id: str,
+        subscriber: Callable[[dict[str, Any]], None],
+    ) -> None:
+        subscribers = self._subscribers.get(request_id)
+        if subscribers is None:
+            return
+        subscribers.discard(subscriber)
+        if not subscribers:
+            self._subscribers.pop(request_id, None)
 
     def bind_parent(self, request_id: str, parent_request_id: str | None) -> None:
         if parent_request_id:

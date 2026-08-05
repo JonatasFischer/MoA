@@ -209,7 +209,7 @@ def test_council_requires_all_distinct_contributor_families() -> None:
         "deepseek",
     }
     assert profile.aggregator.model == "Qwen/Qwen3-Coder-Next-FP8"
-    assert profile.aggregator.think is None
+    assert profile.aggregator.think is True
     assert profile.tool_dispatch.model == "Qwen/Qwen3-Coder-Next-FP8"
     assert profile.reasoning_reserve == {"qwen": 4096}
 

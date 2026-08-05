@@ -38,6 +38,91 @@ class PanelProvider:
         return None
 
 
+TASK_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "task",
+        "description": "Run a private investigation and return its conclusion.",
+        "parameters": {"type": "object"},
+    },
+}
+TASK_CALL = {
+    "id": "call_investigation",
+    "type": "function",
+    "function": {
+        "name": "task",
+        "arguments": json.dumps(
+            {
+                "description": "Investigate implementation",
+                "prompt": "Use Stropha and return only evidence-backed conclusions.",
+                "subagent_type": "explore",
+            }
+        ),
+    },
+}
+STROPHA_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "stropha_rag_execute_investigation",
+        "description": "Run a private Stropha investigation.",
+        "parameters": {"type": "object"},
+    },
+}
+
+
+class TaskProvider(PanelProvider):
+    async def complete(self, model: str, request: CanonicalRequest) -> Completion:
+        self.requests.append((model, request))
+        if isinstance(request.tool_choice, dict):
+            selected = request.tool_choice["function"]["name"]
+            tool_call = (
+                TASK_CALL
+                if selected == "task"
+                else {
+                    "id": "call_stropha",
+                    "type": "function",
+                    "function": {
+                        "name": selected,
+                        "arguments": json.dumps({"task": "inspect routing"}),
+                    },
+                }
+            )
+            return Completion(
+                content="private pre-investigation thought",
+                model=model,
+                finish_reason="tool_calls",
+                tool_calls=[tool_call],
+            )
+        return Completion(content=f"advice from {model}", model=model)
+
+    async def stream(
+        self, model: str, request: CanonicalRequest
+    ) -> AsyncIterator[StreamEvent]:
+        self.requests.append((model, request))
+        yield StreamEvent(content="private pre-investigation thought")
+        yield StreamEvent(
+            tool_calls=[
+                {
+                    "index": 0,
+                    "id": TASK_CALL["id"],
+                    "type": "function",
+                    "function": {"name": "task", "arguments": ""},
+                }
+            ]
+        )
+        yield StreamEvent(
+            tool_calls=[
+                {
+                    "index": 0,
+                    "function": {
+                        "arguments": TASK_CALL["function"]["arguments"],
+                    },
+                }
+            ]
+        )
+        yield StreamEvent(done=True, finish_reason="tool_calls")
+
+
 def classic_config(min_quorum: int = 1) -> GatewayConfig:
     return GatewayConfig.model_validate(
         {
@@ -73,12 +158,14 @@ def council_config(
     min_quorum: int = 3,
     deadline_seconds: float | None = None,
     contributor_format: str = "text",
+    tool_enforcement: dict[str, object] | None = None,
 ) -> GatewayConfig:
     return GatewayConfig.model_validate(
         {
             "server": {
                 "api_key_env": None,
                 "trace_log_path": trace_log_path,
+                "tool_enforcement": tool_enforcement or {},
             },
             "providers": {
                 "local": {
@@ -128,6 +215,17 @@ def council_config(
                 }
             },
             "default_profile": "code",
+        }
+    )
+
+
+def enforced_council_config() -> GatewayConfig:
+    return council_config(
+        tool_enforcement={
+            "enabled": True,
+            "required_tools": ["task"],
+            "enforcement_mode": "auto",
+            "min_investigation_calls": 3,
         }
     )
 
@@ -301,6 +399,271 @@ async def test_tool_result_turn_routes_directly_without_council() -> None:
     assert [model for model, _ in provider.requests] == ["qwen3-coder:30b-128k"]
     assert provider.requests[0][1].tools == tools
     assert provider.requests[0][1].think is False
+
+
+@pytest.mark.asyncio
+async def test_auto_enforcement_forces_private_task_investigation() -> None:
+    provider = TaskProvider()
+    gateway = Gateway(enforced_council_config(), {"local": provider})
+
+    result = await gateway.complete(
+        CanonicalRequest(
+            "moa-code",
+            [{"role": "user", "content": "change the scheduler"}],
+            tools=[TASK_TOOL],
+            tool_choice="auto",
+        )
+    )
+
+    aggregate = provider.requests[-1][1]
+    assert aggregate.tool_choice == {
+        "type": "function",
+        "function": {"name": "task"},
+    }
+    assert "use Stropha" in aggregate.messages[0]["content"]
+    assert "multiple independent" in aggregate.messages[0]["content"]
+    assert result.content == ""
+    assert len(result.tool_calls) == 3
+    assert {call["function"]["name"] for call in result.tool_calls} == {"task"}
+    arguments = [
+        json.loads(call["function"]["arguments"]) for call in result.tool_calls
+    ]
+    assert {item["subagent_type"] for item in arguments} == {"explore"}
+    assert all("Stropha" in item["prompt"] for item in arguments)
+    assert {item["description"] for item in arguments} == {
+        "Architecture investigation",
+        "Implementation investigation",
+        "Verification investigation",
+    }
+    assert result.finish_reason == "tool_calls"
+
+
+@pytest.mark.asyncio
+async def test_enforcement_rejects_request_without_investigation_tool() -> None:
+    provider = PanelProvider()
+    gateway = Gateway(enforced_council_config(), {"local": provider})
+
+    with pytest.raises(UpstreamError, match="required investigation tool"):
+        await gateway.complete(
+            CanonicalRequest(
+                "moa-code",
+                [{"role": "user", "content": "change the scheduler"}],
+                tools=[],
+            )
+        )
+
+    assert provider.requests == []
+
+
+@pytest.mark.asyncio
+async def test_opencode_summary_routes_directly_without_investigation_tool() -> None:
+    provider = PanelProvider()
+    gateway = Gateway(enforced_council_config(), {"local": provider})
+
+    result = await gateway.complete(
+        CanonicalRequest(
+            "moa-code",
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "Create a new anchored summary from the conversation history.\n\n"
+                        "Output exactly the supplied template."
+                    ),
+                }
+            ],
+            tools=[],
+        )
+    )
+
+    assert result.content == "advice from qwen3-coder:30b-128k"
+    assert [model for model, _ in provider.requests] == ["qwen3-coder:30b-128k"]
+
+
+@pytest.mark.asyncio
+async def test_opencode_summary_stream_routes_directly() -> None:
+    provider = PanelProvider()
+    gateway = Gateway(enforced_council_config(), {"local": provider})
+    request = CanonicalRequest(
+        "moa-code",
+        [
+            {
+                "role": "user",
+                "content": "Create a new anchored summary from the conversation history.",
+            }
+        ],
+        tools=[],
+    )
+
+    events = [event async for event in gateway.stream(request)]
+
+    assert [event.content for event in events if event.content] == ["final"]
+    assert [model for model, _ in provider.requests] == ["qwen3-coder:30b-128k"]
+
+
+@pytest.mark.asyncio
+async def test_enforcement_rejects_aggregator_that_skips_investigation() -> None:
+    provider = PanelProvider()
+    gateway = Gateway(enforced_council_config(), {"local": provider})
+
+    with pytest.raises(UpstreamError, match="did not call required investigation"):
+        await gateway.complete(
+            CanonicalRequest(
+                "moa-code",
+                [{"role": "user", "content": "change the scheduler"}],
+                tools=[TASK_TOOL],
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_enforcement_adds_stropha_to_ungrounded_task() -> None:
+    class UngroundedTaskProvider(TaskProvider):
+        async def complete(
+            self, model: str, request: CanonicalRequest
+        ) -> Completion:
+            result = await super().complete(model, request)
+            if result.tool_calls:
+                call = {
+                    **TASK_CALL,
+                    "function": {
+                        **TASK_CALL["function"],
+                        "arguments": json.dumps({"prompt": "Inspect the code"}),
+                    },
+                }
+                return Completion(
+                    content=result.content,
+                    model=result.model,
+                    finish_reason=result.finish_reason,
+                    tool_calls=[call],
+                )
+            return result
+
+    provider = UngroundedTaskProvider()
+    gateway = Gateway(enforced_council_config(), {"local": provider})
+
+    result = await gateway.complete(
+        CanonicalRequest(
+            "moa-code",
+            [{"role": "user", "content": "change the scheduler"}],
+            tools=[TASK_TOOL],
+        )
+    )
+
+    assert len(result.tool_calls) == 3
+    for call in result.tool_calls:
+        arguments = json.loads(call["function"]["arguments"])
+        assert arguments["prompt"].startswith("Inspect the code")
+        assert "use Stropha" in arguments["prompt"]
+        assert arguments["subagent_type"] == "explore"
+
+
+@pytest.mark.asyncio
+async def test_delegated_investigation_routes_directly_without_council() -> None:
+    provider = TaskProvider()
+    gateway = Gateway(enforced_council_config(), {"local": provider})
+
+    result = await gateway.complete(
+        CanonicalRequest(
+            "moa-code",
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "Inspect routing.\n\nMandatory investigation contract: "
+                        "use Stropha as the primary codebase source."
+                    ),
+                }
+            ],
+            tools=[STROPHA_TOOL, TASK_TOOL],
+            tool_choice="auto",
+        )
+    )
+
+    assert result.content == "advice from qwen3-coder:30b-128k"
+    assert [model for model, _ in provider.requests] == ["qwen3-coder:30b-128k"]
+    direct_request = provider.requests[0][1]
+    assert direct_request.tools == [STROPHA_TOOL, TASK_TOOL]
+    assert direct_request.tool_choice == "auto"
+
+
+@pytest.mark.asyncio
+async def test_delegated_investigation_routes_directly_without_stropha_tool() -> None:
+    provider = PanelProvider()
+    gateway = Gateway(enforced_council_config(), {"local": provider})
+
+    result = await gateway.complete(
+        CanonicalRequest(
+            "moa-code",
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "Inspect routing.\n\nMandatory investigation contract: "
+                        "use Stropha as the primary codebase source."
+                    ),
+                }
+            ],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "grep", "parameters": {"type": "object"}},
+                }
+            ],
+            tool_choice="auto",
+        )
+    )
+
+    assert result.content == "advice from qwen3-coder:30b-128k"
+    assert [model for model, _ in provider.requests] == ["qwen3-coder:30b-128k"]
+    assert provider.requests[0][1].tool_choice == "auto"
+
+
+@pytest.mark.asyncio
+async def test_delegated_investigation_stream_routes_directly() -> None:
+    provider = PanelProvider()
+    gateway = Gateway(enforced_council_config(), {"local": provider})
+    request = CanonicalRequest(
+        "moa-code",
+        [
+            {
+                "role": "user",
+                "content": (
+                    "Inspect routing.\n\nMandatory investigation contract: "
+                    "use Stropha as the primary codebase source."
+                ),
+            }
+        ],
+        tools=[STROPHA_TOOL],
+        tool_choice="auto",
+    )
+
+    events = [event async for event in gateway.stream(request)]
+
+    assert [event.content for event in events if event.content] == ["final"]
+    assert [model for model, _ in provider.requests] == ["qwen3-coder:30b-128k"]
+
+
+@pytest.mark.asyncio
+async def test_stream_hides_text_until_private_investigation_returns() -> None:
+    provider = TaskProvider()
+    gateway = Gateway(enforced_council_config(), {"local": provider})
+    request = CanonicalRequest(
+        "moa-code",
+        [{"role": "user", "content": "change the scheduler"}],
+        tools=[TASK_TOOL],
+        tool_choice="auto",
+    )
+
+    events = [event async for event in gateway.stream(request)]
+
+    assert all(event.content != "private pre-investigation thought" for event in events)
+    calls = [call for event in events for call in (event.tool_calls or [])]
+    assert len(calls) == 3
+    assert {call["function"]["name"] for call in calls} == {"task"}
+    assert all("Stropha" in call["function"]["arguments"] for call in calls)
+    assert events[-1].done is True
+    assert events[-1].finish_reason == "tool_calls"
 
 
 @pytest.mark.asyncio

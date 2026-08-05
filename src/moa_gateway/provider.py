@@ -330,3 +330,25 @@ def create_provider(config: ProviderConfig) -> Provider:
         "ollama": OllamaProvider,
     }[config.kind]
     return provider_type(config)
+
+
+async def discover_models(config: ProviderConfig) -> list[str]:
+    headers: dict[str, str] = {}
+    if config.api_key_env and (api_key := os.getenv(config.api_key_env)):
+        headers["Authorization"] = f"Bearer {api_key}"
+    path = "api/tags" if config.kind == "ollama" else "models"
+    async with httpx.AsyncClient(
+        base_url=config.base_url.rstrip("/") + "/",
+        headers=headers,
+        timeout=min(config.timeout_seconds, 10),
+    ) as client:
+        response = await client.get(path)
+    if response.is_error:
+        raise UpstreamError(response.status_code, response.text)
+    try:
+        payload = response.json()
+        entries = payload.get("models" if config.kind == "ollama" else "data", [])
+        names = [entry.get("name") or entry.get("id") for entry in entries]
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise UpstreamError(502, "provider returned an invalid model list") from exc
+    return sorted({str(name) for name in names if name})

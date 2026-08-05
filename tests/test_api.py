@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 
@@ -7,7 +8,7 @@ import httpx
 import pytest
 
 from moa_gateway.app import create_app
-from moa_gateway.config import GatewayConfig
+from moa_gateway.config import GatewayConfig, load_config
 from moa_gateway.domain import CanonicalRequest, Completion, StreamEvent
 
 
@@ -23,6 +24,183 @@ async def test_health_and_model_discovery(api) -> None:
         "claude-moa-code",
         "moa-code",
     ]
+
+
+@pytest.mark.asyncio
+async def test_flow_lab_and_config_api_are_public(api) -> None:
+    client, _ = api
+
+    page = await client.get("/")
+    script = await client.get("/assets/app.js")
+    config = await client.get("/api/config")
+
+    assert page.status_code == 200
+    assert "MoA Flow Lab" in page.text
+    assert "Request filter" in script.text
+    assert "Tool-call gate" in script.text
+    assert "No semantic refinement stage" in script.text
+    assert "runSimulation" in script.text
+    assert config.status_code == 200
+    assert config.json()["generation"] == 1
+    assert config.json()["persisted"] is False
+    assert config.json()["config"]["default_profile"] == "code"
+    assert config.json()["config"]["tool_enforcement"]["enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_config_update_applies_to_the_next_request(api) -> None:
+    client, provider = api
+    payload = (await client.get("/api/config")).json()["config"]
+    payload["profiles"]["code"]["model"] = "experimental-model"
+
+    updated = await client.put("/api/config", json=payload)
+    completion = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "moa-code",
+            "messages": [{"role": "user", "content": "test the flow"}],
+        },
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["generation"] == 2
+    assert completion.status_code == 200
+    assert provider.requests[-1][0] == "experimental-model"
+
+
+@pytest.mark.asyncio
+async def test_config_update_applies_tool_enforcement(api) -> None:
+    client, _ = api
+    payload = (await client.get("/api/config")).json()["config"]
+    payload["tool_enforcement"] = {
+        "enabled": True,
+        "required_tools": ["task"],
+        "enforcement_mode": "auto",
+        "min_investigation_calls": 3,
+    }
+
+    updated = await client.put("/api/config", json=payload)
+
+    assert updated.status_code == 200
+    current = updated.json()["config"]["tool_enforcement"]
+    assert current == payload["tool_enforcement"]
+    assert updated.json()["generation"] == 2
+
+
+@pytest.mark.asyncio
+async def test_simulation_streams_real_gateway_stage_outputs(api) -> None:
+    client, provider = api
+
+    response = await client.post(
+        "/api/simulations",
+        json={"profile": "code", "input": "Explain the flow", "max_tokens": 200},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert '"event": "simulation_started"' in response.text
+    assert '"event": "model_completed"' in response.text
+    assert '"stage": "direct"' in response.text
+    assert '"content": "hello from local"' in response.text
+    assert '"event": "simulation_completed"' in response.text
+    assert provider.requests[-1][0] == "local-model"
+
+
+@pytest.mark.asyncio
+async def test_invalid_config_does_not_replace_live_generation(api) -> None:
+    client, provider = api
+    payload = (await client.get("/api/config")).json()["config"]
+    payload["profiles"]["code"]["provider"] = "missing"
+
+    rejected = await client.put("/api/config", json=payload)
+    current = await client.get("/api/config")
+    completion = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "moa-code",
+            "messages": [{"role": "user", "content": "still live"}],
+        },
+    )
+
+    assert rejected.status_code == 422
+    assert current.json()["generation"] == 1
+    assert completion.status_code == 200
+    assert provider.requests[-1][0] == "local-model"
+
+
+@pytest.mark.asyncio
+async def test_config_swap_keeps_in_flight_request_on_its_generation(
+    gateway_config,
+) -> None:
+    class BlockingProvider:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.models: list[str] = []
+
+        async def complete(
+            self, model: str, request: CanonicalRequest
+        ) -> Completion:
+            self.models.append(model)
+            if model == "local-model":
+                self.started.set()
+                await self.release.wait()
+            return Completion(content=model, model=model)
+
+        async def stream(
+            self, model: str, request: CanonicalRequest
+        ) -> AsyncIterator[StreamEvent]:
+            yield StreamEvent(content=model)
+            yield StreamEvent(done=True, finish_reason="stop")
+
+        async def close(self) -> None:
+            return None
+
+    provider = BlockingProvider()
+    app = create_app(gateway_config, {"local": provider})
+    transport = httpx.ASGITransport(app=app)
+    request = {
+        "model": "moa-code",
+        "messages": [{"role": "user", "content": "run"}],
+    }
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = asyncio.create_task(client.post("/v1/chat/completions", json=request))
+        await provider.started.wait()
+        payload = (await client.get("/api/config")).json()["config"]
+        payload["profiles"]["code"]["model"] = "next-model"
+        assert (await client.put("/api/config", json=payload)).status_code == 200
+        second = await client.post("/v1/chat/completions", json=request)
+        provider.release.set()
+        first_response = await first
+
+    assert second.json()["choices"][0]["message"]["content"] == "next-model"
+    assert first_response.json()["choices"][0]["message"]["content"] == "local-model"
+    assert provider.models == ["local-model", "next-model"]
+
+
+@pytest.mark.asyncio
+async def test_config_update_persists_when_config_path_is_set(
+    gateway_config, api, tmp_path
+) -> None:
+    path = tmp_path / "experiment.yaml"
+    _, provider = api
+    app = create_app(gateway_config, {"local": provider}, config_path=path)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        payload = (await client.get("/api/config")).json()["config"]
+        payload["profiles"]["code"]["model"] = "persisted-model"
+        payload["tool_enforcement"] = {
+            "enabled": True,
+            "required_tools": ["task"],
+            "enforcement_mode": "block",
+            "min_investigation_calls": 2,
+        }
+        response = await client.put("/api/config", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["persisted"] is True
+    assert load_config(path).profiles["code"].model == "persisted-model"
+    assert load_config(path).server.tool_enforcement.min_investigation_calls == 2
 
 
 @pytest.mark.asyncio
@@ -272,6 +450,13 @@ async def test_bearer_and_api_key_auth(gateway_config, api, monkeypatch) -> None
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         assert (await client.get("/v1/models")).status_code == 401
+        assert (await client.get("/api/config")).status_code == 200
+        assert (
+            await client.post(
+                "/api/simulations",
+                json={"profile": "code", "input": "public simulation"},
+            )
+        ).status_code == 200
         assert (
             await client.get(
                 "/v1/models", headers={"Authorization": "Bearer secret"}

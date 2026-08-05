@@ -9,8 +9,9 @@ a typed YAML configuration, CLI, health and model-discovery endpoints, and text
 translation for Anthropic Messages, OpenAI Chat Completions, and OpenAI
 Responses over native Ollama, OpenAI, and DeepSeek upstreams.
 
-The default `code` profile asks two model families to each run the complete
-five-perspective council: `gemma4:latest` and `deepseek-coder-v2:16b`. Each
+The default `code` profile asks three model families to each run the complete
+five-perspective council: `qwen2.5-coder:7b`, `gemma4:latest`, and
+`deepseek-coder-v2:16b`. Each
 contributor returns schema-validated Contrarian,
 Software Architect, Clean Coder, Pragmatic Engineer, and Engineering Manager
 fields. Before querying them, the aggregator model runs one request-analysis filter;
@@ -37,6 +38,41 @@ uv run moa status
 The default configuration is in `moa.yaml`. Public model aliases are
 `claude-moa-code`, `moa-code`, `claude-direct-code`, `direct-code`,
 and `deepseek-direct-code`.
+
+## Flow Lab
+
+After starting the gateway, open `http://127.0.0.1:14598/`. Flow Lab is an
+unauthenticated local control surface for experimenting with direct, classic,
+and council structures. It can create and duplicate flows, arrange contributor,
+aggregator, and tool-dispatch targets, manage provider connections, and discover
+the model IDs exposed by a provider.
+
+The diagram follows the runtime branches implemented in `Gateway`: profile and
+continuation routing, tool-enforcement preflight, the aggregator-backed request
+filter, parallel contribution quorum, aggregation and output enforcement,
+empty-output retry and fallback, and the conditional tool-dispatch bypass. It
+also marks semantic refinement as not implemented rather than presenting
+recovery as a critique/revision pass.
+
+Enter a prompt in **Run the selected flow** to execute that profile against the
+real configured providers. The diagram updates from request-scoped gateway trace
+events, showing stage progress, parallel quorum state, cancellations, retries,
+failures, and completion. Select a node to inspect its raw model output, tool
+calls, usage, errors, and trace records. Runs consume normal provider tokens and
+can be stopped from the dashboard. If tool enforcement produces a client-side
+tool call, the run stops at that real boundary; the dashboard does not fabricate
+the external tool result.
+
+`Apply live` validates the complete experiment before changing anything. New
+requests use the new configuration immediately; requests already in progress
+finish on the configuration generation with which they started. When MoA is
+started with `moa serve`, accepted changes are also written atomically to the
+selected `--config` YAML file. Apps created programmatically without a config
+path apply changes only for the lifetime of the process.
+
+The Flow Lab and its `/api/config` control API intentionally have no
+authentication. Keep the gateway bound to loopback unless every user with
+network access should be allowed to inspect and replace the active experiment.
 
 ## OpenAI And DeepSeek Compatibility
 
@@ -116,6 +152,14 @@ load, prompt-evaluation, and generation durations. Tool-result turns bypass the
 council and route directly to the configured tool dispatcher. Contributor input
 excludes the coding-agent system prompt, tool definitions, and replayed tool
 results.
+
+Before the initial `code` aggregation, MoA requires the client-provided `task`
+tool and instructs the aggregator to delegate private, Stropha-backed
+investigations. MoA validates the tool call but does not execute it; OpenCode runs
+three focused investigators in parallel and returns only their conclusions. Any
+text emitted beside the required call is suppressed so pre-investigation
+reasoning is not exposed to the coding agent. See
+[STROPHA_ENFORCEMENT.md](STROPHA_ENFORCEMENT.md).
 
 The bundled `moa.yaml` also includes a `deepseek-direct-code` profile. The
 DeepSeek adapter can be selected by any custom contributor or aggregator.
