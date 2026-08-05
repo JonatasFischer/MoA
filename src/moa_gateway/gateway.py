@@ -1082,9 +1082,48 @@ class Gateway:
                 profile.strategy == "council"
                 and profile.contributor_format == "json-schema"
             ):
-                return self._validate_council_completion(
-                    request_id, target, completion
-                )
+                try:
+                    return self._validate_council_completion(
+                        request_id, target, completion
+                    )
+                except UpstreamError:
+                    self.trace.record(
+                        "contributor_repairing",
+                        request_id,
+                        stage=stage,
+                        provider=target.provider,
+                        model=target.model,
+                        family=target.family,
+                    )
+                    repair_request = replace(
+                        proposal_request,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Convert the supplied council answer into one JSON "
+                                    "object with exactly these non-empty string fields: "
+                                    + ", ".join(COUNCIL_FIELDS)
+                                    + ". Preserve its substance. Return JSON only, with "
+                                    "no Markdown fence or commentary."
+                                ),
+                            },
+                            {"role": "user", "content": completion.content},
+                        ],
+                    )
+                    async with semaphore:
+                        repaired = await self._complete_model(
+                            request_id,
+                            stage,
+                            target.provider,
+                            target.model,
+                            repair_request,
+                            family=target.family,
+                            role=target.role,
+                        )
+                    return self._validate_council_completion(
+                        request_id, target, repaired
+                    )
             return completion
 
         tasks = {
@@ -1506,7 +1545,14 @@ class Gateway:
                 lines = content.splitlines()
                 if len(lines) >= 3 and lines[0].strip() in {"```", "```json"}:
                     content = "\n".join(lines[1:-1]).strip()
-            value = json.loads(content)
+            try:
+                value = json.loads(content)
+            except json.JSONDecodeError:
+                start = content.find("{")
+                end = content.rfind("}")
+                if start < 0 or end <= start:
+                    raise
+                value = json.loads(content[start : end + 1])
             if not isinstance(value, dict):
                 raise ValueError("response must be an object")
             normalized = {

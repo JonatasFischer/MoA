@@ -64,6 +64,25 @@ class OpenAICompatibleProvider:
             payload["tools"] = request.tools
         if request.tool_choice is not None:
             payload["tool_choice"] = request.tool_choice
+        if request.response_format is not None:
+            response_format = request.response_format
+            if isinstance(response_format, str):
+                response_format = {"type": response_format}
+            elif response_format.get("type") in {"json_object", "text"}:
+                pass
+            elif not (
+                response_format.get("type") == "json_schema"
+                and "json_schema" in response_format
+            ):
+                response_format = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "structured_response",
+                        "strict": True,
+                        "schema": response_format,
+                    },
+                }
+            payload["response_format"] = response_format
         if request.think is not None:
             payload["think"] = request.think
         if stream:

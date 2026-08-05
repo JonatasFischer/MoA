@@ -1121,7 +1121,7 @@ async def test_structured_council_is_validated_before_aggregation() -> None:
             self.requests.append((model, request))
             if model == "qwen3.6:27b":
                 return Completion(content="final", model=model)
-            content = "```json\n" + json.dumps(
+            content = json.dumps(
                 {
                     "contrarian": "risk",
                     "software_architect": "boundaries",
@@ -1129,7 +1129,11 @@ async def test_structured_council_is_validated_before_aggregation() -> None:
                     "pragmatic_engineer": "trade-offs",
                     "engineering_manager": "scope",
                 }
-            ) + "\n```"
+            )
+            if model == "qwen2.5-coder:7b":
+                content = "```json\n" + content + "\n```"
+            elif model == "gemma4:latest":
+                content = "Structured result:\n" + content + "\nEnd result."
             return Completion(content=content, model=model)
 
     provider = StructuredProvider()
@@ -1170,6 +1174,46 @@ async def test_invalid_structured_council_does_not_count_toward_quorum() -> None
         await gateway.complete(
             CanonicalRequest("moa-code", [{"role": "user", "content": "solve"}])
         )
+
+
+@pytest.mark.asyncio
+async def test_invalid_structured_council_is_repaired_once() -> None:
+    class RepairProvider(PanelProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.repairs = 0
+
+        async def complete(self, model: str, request: CanonicalRequest) -> Completion:
+            self.requests.append((model, request))
+            if model == "qwen3.6:27b":
+                return Completion(content="final", model=model)
+            if request.messages[0]["content"].startswith("Convert the supplied"):
+                self.repairs += 1
+                return Completion(
+                    content=json.dumps(
+                        {
+                            "contrarian": "risk",
+                            "software_architect": "boundaries",
+                            "clean_coder": "readability",
+                            "pragmatic_engineer": "trade-offs",
+                            "engineering_manager": "scope",
+                        }
+                    ),
+                    model=model,
+                )
+            return Completion(content="Council analysis in plain text.", model=model)
+
+    provider = RepairProvider()
+    gateway = Gateway(
+        council_config(contributor_format="json-schema"), {"local": provider}
+    )
+
+    result = await gateway.complete(
+        CanonicalRequest("moa-code", [{"role": "user", "content": "solve"}])
+    )
+
+    assert result.content == "final"
+    assert provider.repairs == 3
 
 
 @pytest.mark.asyncio

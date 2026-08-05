@@ -68,6 +68,12 @@ async def test_openai_compatible_complete_and_stream() -> None:
         requested_model="moa-code",
         messages=[{"role": "user", "content": "hi"}],
         think=False,
+        response_format={
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        },
     )
 
     completion = await provider.complete("local-model", canonical)
@@ -81,7 +87,16 @@ async def test_openai_compatible_complete_and_stream() -> None:
     assert events[-1].usage.total_tokens == 5
     assert requests[0]["model"] == "local-model"
     assert requests[0]["think"] is False
+    assert requests[0]["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "structured_response",
+            "strict": True,
+            "schema": canonical.response_format,
+        },
+    }
     assert requests[1]["think"] is False
+    assert requests[1]["response_format"] == requests[0]["response_format"]
     assert requests[1]["stream_options"] == {"include_usage": True}
 
 
