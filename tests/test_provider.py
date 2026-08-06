@@ -6,8 +6,9 @@ import httpx
 import pytest
 
 from moa_gateway.config import ProviderConfig
-from moa_gateway.domain import CanonicalRequest, ProviderMetrics
+from moa_gateway.domain import CanonicalRequest, ProviderMetrics, Usage
 from moa_gateway.provider import (
+    CapabilityError,
     DeepSeekProvider,
     OpenAICompatibleProvider,
     OpenAIProvider,
@@ -370,3 +371,113 @@ async def test_native_ollama_rejects_stream_without_done() -> None:
             )
         ]
     await provider.close()
+
+
+def test_provider_capabilities_support_per_model_overrides() -> None:
+    config = ProviderConfig.model_validate(
+        {
+            "type": "openai-compatible",
+            "base_url": "http://local.test/v1",
+            "input_modalities": ["text"],
+            "model_input_modalities": {
+                "vision-model": ["text", "image"],
+            },
+        }
+    )
+
+    assert config.modalities_for("text-model") == {"text"}
+    assert config.modalities_for("vision-model") == {"text", "image"}
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_forwards_multimodal_messages() -> None:
+    payload: dict = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "model": "vision-model",
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "described"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
+
+    provider = OpenAICompatibleProvider(
+        ProviderConfig.model_validate(
+            {
+                "type": "openai-compatible",
+                "base_url": "http://local.test/v1",
+                "input_modalities": ["text", "image"],
+            }
+        )
+    )
+    await provider.client.aclose()
+    provider.client = httpx.AsyncClient(
+        base_url="http://local.test/v1/", transport=httpx.MockTransport(handler)
+    )
+    content = [
+        {"type": "text", "text": "Describe it"},
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
+        },
+    ]
+
+    await provider.complete(
+        "vision-model", CanonicalRequest(None, [{"role": "user", "content": content}])
+    )
+
+    assert payload["messages"][0]["content"] == content
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_provider_rejects_unsupported_modality_before_transport() -> None:
+    provider = OpenAICompatibleProvider(
+        ProviderConfig.model_validate(
+            {"type": "openai-compatible", "base_url": "http://local.test/v1"}
+        )
+    )
+    request = CanonicalRequest(
+        None,
+        [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
+                    }
+                ],
+            }
+        ],
+    )
+
+    with pytest.raises(CapabilityError, match="does not support"):
+        await provider.complete("text-model", request)
+
+    await provider.close()
+
+
+def test_openai_usage_preserves_cached_and_reasoning_details() -> None:
+    usage = Usage.from_openai(
+        {
+            "prompt_tokens": 20,
+            "completion_tokens": 8,
+            "prompt_tokens_details": {"cached_tokens": 12},
+            "completion_tokens_details": {"reasoning_tokens": 5},
+        }
+    )
+
+    assert usage == Usage(
+        input_tokens=20,
+        output_tokens=8,
+        cached_input_tokens=12,
+        reasoning_output_tokens=5,
+    )

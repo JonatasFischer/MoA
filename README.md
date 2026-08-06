@@ -1,33 +1,16 @@
 # MoA Gateway
 
 A local, configurable Mixture-of-Agents gateway for Claude Code, OpenCode, and
-Codex. The project is under active development. See [PLAN.md](PLAN.md) for the
-architecture, protocol requirements, and milestones.
+Codex. MoA exposes configured flows as model IDs while executing each flow as a
+validated graph of AI steps and synchronization gates.
 
-The current implementation provides direct, classic, and council MoA strategies,
-a typed YAML configuration, CLI, health and model-discovery endpoints, and text
-translation for Anthropic Messages, OpenAI Chat Completions, and OpenAI
-Responses over native Ollama, OpenAI, and DeepSeek upstreams.
-
-The default `code` profile asks three model families to each run the complete
-five-perspective council: `qwen2.5-coder:7b`, `gemma4:latest`, and
-`deepseek-coder-v2:16b`. Each
-contributor returns schema-validated Contrarian,
-Software Architect, Clean Coder, Pragmatic Engineer, and Engineering Manager
-fields. Before querying them, the aggregator model runs one request-analysis filter;
-its output becomes additional untrusted context for every contributor and the final
-aggregation. Aggregation starts after two valid responses or fails at the 45-second
-deadline; the aggregator acts as the implementing Engineer, considers every
-perspective, controls scope and complexity, and proceeds with the smallest correct
-implementation instead of returning a council transcript.
+The gateway accepts Anthropic Messages, OpenAI Chat Completions, and OpenAI
+Responses requests over native Ollama, OpenAI, DeepSeek, and generic
+OpenAI-compatible providers.
 
 ## Development
 
 ```bash
-ollama pull qwen2.5-coder:7b
-ollama pull qwen3.6:27b
-ollama pull gemma4
-ollama pull deepseek-coder-v2:16b
 uv sync --all-groups
 uv run pytest
 uv run moa config validate
@@ -35,55 +18,221 @@ uv run moa serve
 uv run moa status
 ```
 
-The default configuration is in `moa.yaml`. Public model aliases are
-`claude-moa-code`, `moa-code`, `claude-direct-code`, `direct-code`,
-and `deepseek-direct-code`.
+The active configuration is `moa.yaml`. The bundled public model aliases are:
+
+- `claude-direct-code`
+- `direct-code`
+- `moa-code`
+- `benchmark-council-k2`
+- `benchmark-council-k3`
+- `benchmark-self-consistency`
+- `deepseek-direct-code`
+
+## Configured Flows
+
+Configuration version 2 has four primary catalogs:
+
+- `providers`: upstream connections and credentials.
+- `prompts`: reusable system and context templates.
+- `tool_validators`: deterministic validation and transformation of model tool calls.
+- `flows`: public models composed from AI steps and gates.
+
+Providers declare accepted input modalities globally or per model. Text is always
+required and is the safe default:
+
+```yaml
+providers:
+  local:
+    type: openai-compatible
+    base_url: http://127.0.0.1:11434/v1
+    input_modalities: [text]
+    model_input_modalities:
+      vision-model: [text, image]
+      document-model: [text, image, file]
+```
+
+OpenAI image/file blocks, Anthropic image/document blocks, and Responses
+`input_image`/`input_file` blocks are normalized into one canonical representation.
+Requests are rejected before provider transport when the selected model does not
+declare every required modality.
+
+Every flow is stored as a list of steps. Links between step IDs define the actual
+execution graph; list order is only for readability.
+
+Flows can opt into deterministic request-shape routing with a `simple_request`
+start. Existing continuation starts should remain first, and `always` remains the
+required fallback:
+
+```yaml
+routing:
+  max_latest_user_chars: 800
+  max_conversation_chars: 4000
+  max_messages: 4
+  require_no_tools: true
+starts:
+- {step: continue, when: tool_continuation}
+- {step: direct-answer, when: simple_request}
+- {step: request-filter, when: always}
+```
+
+### AI Steps
+
+An `ai` step selects its prompt, provider, model, conversation visibility,
+generation controls, tools, validation, retries, fallback, and targets:
+
+```yaml
+- id: reviewer
+  type: ai
+  prompt: classic-proposer
+  prompt_variables:
+    role: independent reviewer
+  provider: ollama
+  model: gemma4:latest
+  conversation: advisory
+  max_tokens: 1024
+  temperature: 0.2
+  targets:
+  - step: proposals
+```
+
+Prompt templates can use:
+
+- `{{request}}`: latest user request.
+- `{{conversation}}`: selected canonical conversation as JSON.
+- `{{tools}}`: client tool names and descriptions.
+- `{{inputs}}`: results that activated the current step.
+- `{{steps.<id>}}`: completed output from a named prior step.
+- `{{investigation_results}}`: tool-result content already in the conversation.
+- `{{remaining_investigations}}`: remaining allowance on the current step.
+
+### Gates
+
+A `gate` is notified by every step that targets it. It bounds concurrency, applies
+one shared deadline, waits for all sources or the deadline, and requires at least
+`min_success` successful results:
+
+```yaml
+- id: contributions
+  type: gate
+  min_success: 2
+  max_concurrency: 3
+  deadline_seconds: 45
+  completion: all-or-deadline
+  on_failure: fail
+  targets:
+  - step: aggregate
+```
+
+The compiler rejects cycles, duplicate links, conditional gate sources, unreachable
+steps, gates without enough sources, unknown references, invalid JSON Schemas,
+fallback gates that are not ancestors, and any path that cannot reach `$return`.
+
+### Public Models
+
+Aliases on a flow become entries in `GET /v1/models`:
+
+```yaml
+flows:
+  direct:
+    aliases: [claude-direct-code, direct-code]
+    starts:
+    - {step: answer, when: always}
+    output: {step: answer}
+    steps:
+    - id: answer
+      type: ai
+      provider: lms
+      model: Qwen/Qwen3-Coder-Next-FP8
+      conversation: full
+      tools:
+        mode: client
+        validator: client-tools
+      targets:
+      - step: $return
+
+default_flow: code
+```
+
+Requests can select either an internal flow name or one of its aliases. Discovery
+advertises aliases.
+
+## Default Code Flow
+
+The bundled `code` flow is entirely represented in `moa.yaml`:
+
+```text
+request-filter
+  -> qwen-council ---------+
+  -> gemma-council --------+-> contributions gate
+  -> deepseek-council -----+       -> aggregate
+                                      | tool call -> return
+                                      | text -> investigation-check
+                                                   | no gap -> return aggregate unchanged
+                                                   | gap -> task tool call
+
+tool result -> integrate-investigation -> investigation-check
+```
+
+The contributor gate requires two successful responses, permits three concurrent
+calls, and uses a shared 45-second deadline. Structured council responses are
+validated against `council-response` and repaired once when invalid. Empty
+aggregation retries once with twice the token budget and thinking disabled, then
+falls back to the best non-empty gate result.
+
+## Investigation Check
+
+Investigation is decided by a dedicated output step after aggregation, not by the
+aggregator itself.
+
+The aggregator can use normal client tools but does not receive `task`. For a text
+answer, `investigation-check` receives only configured investigation tools and asks
+whether a material unanswered question could change correctness or implementation.
+
+When no investigation is needed, the checker's private JSON decision is discarded
+and the aggregate answer is returned unchanged. When investigation is needed, only
+the grounded tool call is returned. The configured validator:
+
+- requires the tool to exist in the client request;
+- requires a stable call ID and JSON-object arguments;
+- forces `subagent_type: explore` for `task`;
+- prepends the latest user request;
+- always appends the mandatory Stropha evidence contract;
+- removes private text emitted beside the investigation call;
+- never executes the tool inside MoA.
+
+The client executes the investigation. Its tool result starts a new flow run at
+`integrate-investigation`, whose answer is checked again. The maximum number of
+investigations is mandatory configuration on the checker step; the bundled flow
+uses three. Once exhausted, `task` is no longer exposed to the checker.
+
+Normal tool results use the same continuation path, so coding-agent loops do not
+rerun the contributor panel on every read, command, or edit result.
 
 ## Flow Lab
 
-After starting the gateway, open `http://127.0.0.1:14598/`. Flow Lab is an
-unauthenticated local control surface for experimenting with direct, classic,
-and council structures. It can create and duplicate flows, arrange contributor,
-aggregator, and tool-dispatch targets, manage provider connections, and discover
-the model IDs exposed by a provider.
+Start the gateway and open `http://127.0.0.1:14598/`.
 
-The diagram follows the runtime branches implemented in `Gateway`: profile and
-continuation routing, tool-enforcement preflight, the aggregator-backed request
-filter, parallel contribution quorum, aggregation and output enforcement,
-empty-output retry and fallback, and the conditional tool-dispatch bypass. It
-also marks semantic refinement as not implemented rather than presenting
-recovery as a critique/revision pass.
+Flow Lab reads the same v2 flow definitions that the core compiles. It renders every
+configured step and target as a graph, edits AI and gate properties, manages prompts
+and providers, validates changes, and writes accepted changes atomically to the
+selected YAML file.
 
-Enter a prompt in **Run the selected flow** to execute that profile against the
-real configured providers. The diagram updates from request-scoped gateway trace
-events, showing stage progress, parallel quorum state, cancellations, retries,
-failures, and completion. Select a node to inspect its raw model output, tool
-calls, usage, errors, and trace records. Runs consume normal provider tokens and
-can be stopped from the dashboard. If tool enforcement produces a client-side
-tool call, the run stops at that real boundary; the dashboard does not fabricate
-the external tool result.
+Runs use real providers and tokens. If a draft has unapplied changes, Flow Lab first
+applies and validates it so the displayed graph cannot differ from the executed
+generation. Trace events carry `flow_id` and `node_id`, allowing runtime state and
+outputs to be associated directly with graph nodes.
 
-`Apply live` validates the complete experiment before changing anything. New
-requests use the new configuration immediately; requests already in progress
-finish on the configuration generation with which they started. When MoA is
-started with `moa serve`, accepted changes are also written atomically to the
-selected `--config` YAML file. Apps created programmatically without a config
-path apply changes only for the lifetime of the process.
+Requests already in progress retain the configuration generation with which they
+started. New requests use the replacement generation.
 
-The Flow Lab and its `/api/config` control API intentionally have no
-authentication. Keep the gateway bound to loopback unless every user with
-network access should be allowed to inspect and replace the active experiment.
+The Flow Lab and `/api/config` control API are intentionally unauthenticated. Keep
+the gateway bound to loopback unless every network user should be able to inspect
+and replace the active configuration.
 
-## OpenAI And DeepSeek Compatibility
+## OpenAI Compatibility
 
-Start the gateway with `uv run moa serve`. It accepts Chat Completions at both
-`http://127.0.0.1:14598/v1/chat/completions` (OpenAI-style base URL) and
-`http://127.0.0.1:14598/chat/completions` (DeepSeek-style base URL). The same
-request and response schema, bearer authentication, streaming, and function
-tools are supported on both paths.
-
-For OpenAI-compatible clients, set the base URL to
-`http://127.0.0.1:14598/v1` and select `moa-code`:
+Start the gateway with `uv run moa serve`, then use the OpenAI-compatible base URL
+`http://127.0.0.1:14598/v1`:
 
 ```bash
 curl http://127.0.0.1:14598/v1/chat/completions \
@@ -92,130 +241,56 @@ curl http://127.0.0.1:14598/v1/chat/completions \
   -d '{"model":"moa-code","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-OpenAI and DeepSeek are first-class MoA backend adapters over their compatible
-Chat Completions APIs. Their standard URLs and API-key environment variable
-names are defaults, so only the provider type is required:
+The unversioned DeepSeek-style endpoint is also available at
+`/chat/completions`.
 
-```yaml
-providers:
-  openai:
-    type: openai
-    timeout_seconds: 1800
-  deepseek:
-    type: deepseek
-    timeout_seconds: 1800
-```
+## Live Reconfiguration
 
-Set `OPENAI_API_KEY` or `DEEPSEEK_API_KEY` before starting the gateway. A
-custom `base_url` or `api_key_env` can still override either default.
+`PUT /api/config` validates and compiles every flow before activation. Invalid
+updates leave the current generation untouched. Accepted updates are persisted by
+writing a temporary YAML file and atomically replacing the configured path.
 
-Any profile target can select these providers. Council profiles require at
-least two contributors with distinct `family` values. Every contributor runs
-all five perspectives, and the aggregator receives every complete answer:
-
-```yaml
-profiles:
-  code:
-    aliases: [moa-code]
-    strategy: council
-    contributors:
-      - provider: ollama
-        model: gemma4:latest
-        family: gemma
-      - provider: ollama
-        model: deepseek-coder-v2:16b
-        family: deepseek
-    aggregator:
-      provider: ollama
-      model: qwen3.6:27b
-      family: qwen
-      think: false
-    min_quorum: 2
-    max_concurrency: 1
-    contributor_deadline_seconds: 45
-    contributor_max_tokens: 2560
-    contributor_format: json-schema
-    reasoning_reserve:
-      qwen: 4096
-```
-
-For aggregation, a configured family reserve is added to the client's output
-budget before the upstream call. If aggregation still returns no content or
-tool calls, MoA retries once with twice that internal budget and thinking
-disabled, then falls back to the strongest non-empty contributor response.
-MoA returns an upstream error rather than an empty successful response when no
-fallback is available.
-
-Native Ollama targets can also set `keep_alive` and `num_ctx`. The bundled
-configuration warms the active `code` profile at startup and records Ollama's
-load, prompt-evaluation, and generation durations. Tool-result turns bypass the
-council and route directly to the configured tool dispatcher. Contributor input
-excludes the coding-agent system prompt, tool definitions, and replayed tool
-results.
-
-Before the initial `code` aggregation, MoA requires the client-provided `task`
-tool and instructs the aggregator to delegate private, Stropha-backed
-investigations. MoA validates the tool call but does not execute it; OpenCode runs
-three focused investigators in parallel and returns only their conclusions. Any
-text emitted beside the required call is suppressed so pre-investigation
-reasoning is not exposed to the coding agent. See
-[STROPHA_ENFORCEMENT.md](STROPHA_ENFORCEMENT.md).
-
-The bundled `moa.yaml` also includes a `deepseek-direct-code` profile. The
-DeepSeek adapter can be selected by any custom contributor or aggregator.
-
-Streaming clients receive SSE progress comments while the contributor quorum and
-aggregation stages run. The local OpenCode provider still uses 30-minute
-full-request, header, and stream chunk timeouts for model loading and long
-generations.
+Provider instances and old flow snapshots remain available to requests holding a
+runtime lease. They are closed after the final request on that generation completes.
 
 ## Execution Trace
 
-The bundled configuration writes an append-only JSONL trace to
-`moa-trace.jsonl`. Records are flushed immediately and correlated by
-`request_id`. They include model inputs, complete contributor and aggregator
-outputs, failures, cancellations, stage lifecycle, provider timing breakdowns,
-per-stage and total token usage, contributor scores, tool calls, and streaming
-deltas. `X-MoA-Parent-Request-ID` can correlate nested agent work; every API
-response returns `X-MoA-Request-ID`.
-
-Follow all activity in real time:
+The bundled configuration writes append-only JSONL to `moa-trace.jsonl`. Records
+include request IDs, parent request IDs, flow and node IDs, model inputs and outputs,
+gate progress, failures, retries, tool validation, provider timing, and usage.
 
 ```bash
 tail -f moa-trace.jsonl
 ```
 
-With `jq`, show only completed model responses:
-
-```bash
-tail -f moa-trace.jsonl | jq -c \
-  'select(.event == "model_completed") | {request_id, stage, model, duration_seconds, content}'
-```
-
-Set `server.trace_log_path: null` to disable tracing. The trace contains full
-prompts, tool results, and model responses, so treat it as sensitive local data.
-The default 32 MiB cap retains three rotated backups.
+Trace files contain full prompts, tool results, and model responses. Treat them as
+sensitive local data.
 
 ## Benchmark
 
-Run the executable coding benchmark with:
+Run the coding benchmark with:
 
 ```bash
 uv run moa benchmark --runs 3 \
   --output benchmark-results.json --allow-code-execution
 ```
 
-Generated Python is AST-screened before running deterministic tests in a
-temporary directory. The default arms are `direct`, `council-k2`, `council-k3`,
-and `self-consistency`; promotion requires a strict pass@1 improvement over
-direct. See [BENCHMARK.md](BENCHMARK.md) for details.
+The default arms are `direct`, `council-k2`, `council-k3`, and
+`self-consistency`. They are ordinary configured flows, not hard-coded runtime
+strategies.
 
 ## Current Limitations
 
-- Anthropic Messages and OpenAI Responses tool calling is rejected rather than
-  silently discarded; Chat Completions function tools are supported.
-- Input is text-only.
-- Client prompt usage is a deterministic estimate; trace `usage_total` uses the
-  exact token counts reported by every provider stage.
-
-These limitations correspond to the staged implementation in `PLAN.md`.
+- Function tools, calls, results, and argument deltas are supported across Chat
+  Completions, Anthropic Messages, and OpenAI Responses. Responses custom tools,
+  local-shell items, and server-managed conversations remain unsupported.
+- Image and file input is capability-gated. The bundled coding models remain
+  text-only until a compatible provider/model is explicitly configured. Native
+  Ollama image input accepts the image values supported by its chat API; files need
+  an OpenAI-compatible provider.
+- Terminal AI steps stream provider deltas directly. A step that still requires
+  schema repair, transformed/discarded tool output, or a post-answer checker remains
+  buffered because already emitted protocol events cannot be retracted.
+- Client prompt usage falls back to a deterministic estimate only when the final
+  provider omits counts. Trace usage totals include every provider call, retry, and
+  repair.

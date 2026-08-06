@@ -59,6 +59,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def _starter_config(model: str) -> dict[str, object]:
     return {
+        "version": 2,
         "server": {
             "host": "127.0.0.1",
             "port": 8080,
@@ -72,15 +73,37 @@ def _starter_config(model: str) -> dict[str, object]:
                 "timeout_seconds": 1800,
             }
         },
-        "profiles": {
-            "code": {
-                "aliases": ["claude-moa-code", "moa-code"],
-                "strategy": "direct",
-                "provider": "ollama",
-                "model": model,
+        "tool_validators": {
+            "client-tools": {
+                "allowed_tools": "client",
+                "require_client_definition": True,
+                "require_call_id": True,
+                "arguments": "json-object",
+                "mixed_text": "preserve",
             }
         },
-        "default_profile": "code",
+        "flows": {
+            "code": {
+                "aliases": ["claude-moa-code", "moa-code"],
+                "starts": [{"step": "answer", "when": "always"}],
+                "output": {"step": "answer"},
+                "steps": [
+                    {
+                        "id": "answer",
+                        "type": "ai",
+                        "provider": "ollama",
+                        "model": model,
+                        "conversation": "full",
+                        "tools": {
+                            "mode": "client",
+                            "validator": "client-tools",
+                        },
+                        "targets": [{"step": "$return"}],
+                    }
+                ],
+            }
+        },
+        "default_flow": "code",
     }
 
 
@@ -179,10 +202,12 @@ def main() -> None:
         raise SystemExit(2) from exc
 
     if args.command == "config" and args.config_command == "validate":
-        print(
-            f"valid: {len(config.providers)} provider(s), "
-            f"{len(config.profiles)} profile(s)"
+        configured = (
+            f"{len(config.flows)} flow(s)"
+            if config.uses_flows
+            else f"{len(config.profiles)} profile(s)"
         )
+        print(f"valid: {len(config.providers)} provider(s), {configured}")
         return
 
     if args.command == "serve":

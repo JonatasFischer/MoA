@@ -23,6 +23,8 @@ class CanonicalRequest:
 class Usage:
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_input_tokens: int = 0
+    reasoning_output_tokens: int = 0
 
     @property
     def total_tokens(self) -> int:
@@ -31,9 +33,15 @@ class Usage:
     @classmethod
     def from_openai(cls, value: dict[str, Any] | None) -> "Usage":
         value = value or {}
+        prompt_details = value.get("prompt_tokens_details") or {}
+        completion_details = value.get("completion_tokens_details") or {}
         return cls(
             input_tokens=int(value.get("prompt_tokens", 0) or 0),
             output_tokens=int(value.get("completion_tokens", 0) or 0),
+            cached_input_tokens=int(prompt_details.get("cached_tokens", 0) or 0),
+            reasoning_output_tokens=int(
+                completion_details.get("reasoning_tokens", 0) or 0
+            ),
         )
 
 
@@ -66,3 +74,54 @@ class StreamEvent:
     usage: Usage | None = None
     metrics: ProviderMetrics | None = None
     done: bool = False
+
+
+def content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "".join(
+        str(block.get("text") or "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+
+
+def request_modalities(request: CanonicalRequest) -> set[str]:
+    modalities = {"text"}
+    for message in request.messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "image_url":
+                modalities.add("image")
+            elif block.get("type") == "file":
+                modalities.add("file")
+    return modalities
+
+
+def merge_tool_call_deltas(
+    fragments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: dict[int, dict[str, Any]] = {}
+    for position, fragment in enumerate(fragments):
+        index = fragment.get("index")
+        if not isinstance(index, int):
+            index = position
+        call = merged.setdefault(index, {"index": index, "function": {}})
+        for key in ("id", "type"):
+            if fragment.get(key) is not None:
+                call[key] = fragment[key]
+        source_function = fragment.get("function") or {}
+        function = call["function"]
+        if source_function.get("name"):
+            function["name"] = source_function["name"]
+        if source_function.get("arguments") is not None:
+            function["arguments"] = str(function.get("arguments") or "") + str(
+                source_function["arguments"]
+            )
+    return [merged[index] for index in sorted(merged)]

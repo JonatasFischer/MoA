@@ -105,10 +105,21 @@ def test_strategy_gate_requires_strict_quality_improvement() -> None:
 def test_benchmark_profiles_cover_four_strategy_arms() -> None:
     config = load_config("moa.yaml")
 
-    assert len(config.profiles["council-k2"].proposers) == 2
-    assert len(config.profiles["council-k3"].proposers) == 3
-    assert len({p.model for p in config.profiles["council-k3"].proposers}) == 3
+    k2 = config.flows["council-k2"].step_map
+    k3 = config.flows["council-k3"].step_map
+    assert k2["proposals"].min_success == 2
+    assert k3["proposals"].min_success == 3
+    assert {step_id for step_id in k2 if step_id in {"implementer", "reviewer"}} == {
+        "implementer",
+        "reviewer",
+    }
+    assert {k3[name].model for name in ("implementer", "reviewer", "edge-cases")} == {
+        "qwen2.5-coder:7b",
+        "gemma4:latest",
+        "deepseek-coder-v2:16b",
+    }
     self_models = {
-        proposer.model for proposer in config.profiles["self-consistency"].proposers
+        config.flows["self-consistency"].step_map[name].model
+        for name in ("sample-one", "sample-two", "sample-three")
     }
     assert self_models == {"qwen2.5-coder:7b"}

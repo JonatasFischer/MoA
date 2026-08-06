@@ -19,7 +19,6 @@
         <span id="runtime-label">Connecting to runtime</span>
       </div>
       <div class="top-actions">
-        <button class="button ghost" id="policy-button" type="button">Tool enforcement</button>
         <button class="button ghost" id="providers-button" type="button">Providers</button>
         <button class="button primary" id="apply-button" type="button" disabled>
           <span>Apply live</span><kbd>CMD S</kbd>
@@ -43,10 +42,12 @@
       <section class="workspace">
         <div class="workspace-heading">
           <div>
-            <span class="eyebrow" id="flow-strategy">FLOW STRUCTURE</span>
+            <span class="eyebrow" id="flow-structure">FLOW STRUCTURE</span>
             <h1 id="flow-title">Select a flow</h1>
           </div>
           <div class="workspace-actions">
+            <button class="button step-action" id="add-ai-step" type="button">+ AI step</button>
+            <button class="button step-action" id="add-gate-step" type="button">+ Gate</button>
             <button class="button text" id="duplicate-flow" type="button">Duplicate</button>
             <button class="button danger-text" id="delete-flow" type="button">Delete</button>
           </div>
@@ -54,7 +55,7 @@
         <div class="simulation-console">
           <div class="simulation-input-wrap">
             <label for="simulation-input">RUN THE SELECTED FLOW</label>
-            <textarea id="simulation-input" rows="2" placeholder="Enter a real prompt to send through this profile..."></textarea>
+            <textarea id="simulation-input" rows="2" placeholder="Enter a real prompt to send through this flow..."></textarea>
           </div>
           <div class="simulation-budget">
             <label for="simulation-max-tokens">MAX TOKENS</label>
@@ -70,10 +71,10 @@
           <div id="flow-canvas" class="flow-canvas"></div>
         </div>
         <div class="legend">
-          <span><i class="dot system"></i>Gateway stage</span>
-          <span><i class="dot contributor"></i>Model call</span>
-          <span><i class="dot dispatch"></i>Conditional route</span>
-          <span><i class="dot recovery"></i>Recovery only</span>
+          <span><i class="dot ai"></i>AI step</span>
+          <span><i class="dot gate"></i>Gate</span>
+          <span><i class="dot return"></i>Return terminal</span>
+          <span><i class="route-line"></i>Target route</span>
         </div>
       </section>
 

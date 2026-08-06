@@ -3,13 +3,17 @@ const state = {
   generation: 0,
   persisted: false,
   selectedFlow: null,
-  selectedTarget: null,
+  selectedStep: null,
   dirty: false,
+  applying: false,
+  unsupportedV1: false,
+  editorErrors: new Map(),
   modelOptions: {},
   simulation: {
     active: false,
     controller: null,
-    profile: null,
+    flow: null,
+    start: null,
     requestId: null,
     events: [],
     nodeStates: {},
@@ -22,6 +26,8 @@ const esc = (value) => String(value ?? "")
   .replaceAll("&", "&amp;").replaceAll("<", "&lt;")
   .replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 const clone = (value) => JSON.parse(JSON.stringify(value));
+const startConditions = ["always", "investigation_result", "tool_continuation", "opencode_maintenance", "delegated_investigation", "simple_request"];
+const targetConditions = ["always", "has_tool_calls", "no_tool_calls"];
 
 function toast(message, error = false) {
   const element = $("#toast");
@@ -33,29 +39,89 @@ function toast(message, error = false) {
 
 function markDirty() {
   state.dirty = true;
-  $("#apply-button").disabled = false;
+  $("#apply-button").disabled = state.applying || state.simulation.active;
   $("#dirty-label").textContent = "UNAPPLIED";
 }
 
-function targetTemplate(provider = "") {
-  return { provider, model: "", role: "general" };
+function currentFlow() {
+  return state.config?.flows?.[state.selectedFlow];
 }
 
-function currentProfile() {
-  return state.config?.profiles[state.selectedFlow];
+function selectedStep() {
+  return currentFlow()?.steps.find((step) => step.id === state.selectedStep) || null;
 }
 
-function allTargets(profile) {
-  if (profile.strategy === "direct") return [{ provider: profile.provider, model: profile.model }];
-  return [...(profile.proposers || []), ...(profile.contributors || []), profile.aggregator, profile.tool_dispatch].filter(Boolean);
+function optionList(values, selected, emptyLabel = null) {
+  const options = emptyLabel == null ? [] : [`<option value="">${esc(emptyLabel)}</option>`];
+  return options.concat(values.map((value) => `<option value="${esc(value)}" ${value === selected ? "selected" : ""}>${esc(value)}</option>`)).join("");
 }
 
-function flowGlyph(strategy) {
-  return strategy === "direct" ? "1>1" : strategy === "classic" ? "N>1" : "C>1";
+function uniqueId(base, values) {
+  let value = base;
+  let suffix = 2;
+  while (values.includes(value)) value = `${base}-${suffix++}`;
+  return value;
+}
+
+function parseList(value) {
+  return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function parseOptionalNumber(value) {
+  return value === "" ? null : Number(value);
+}
+
+function parseMaxTokens(value) {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  return trimmed === "request" ? "request" : Number(trimmed);
+}
+
+function setOptional(object, field, value) {
+  if (value === null || value === "" || Number.isNaN(value)) delete object[field];
+  else object[field] = value;
+}
+
+function ordinaryStart(flow) {
+  return flow?.starts.find((start) => start.when === "always")?.step || null;
+}
+
+function ancestorGateIds(flow, stepId) {
+  const ancestors = new Set();
+  const pending = [stepId];
+  while (pending.length) {
+    const targetId = pending.pop();
+    flow.steps.forEach((candidate) => {
+      if (!ancestors.has(candidate.id) && candidate.targets.some((target) => target.step === targetId)) {
+        ancestors.add(candidate.id);
+        pending.push(candidate.id);
+      }
+    });
+  }
+  return flow.steps.filter((step) => step.type === "gate" && ancestors.has(step.id)).map((step) => step.id);
+}
+
+function commitActiveEditor() {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement || active instanceof HTMLSelectElement)) return;
+  active.dispatchEvent(new Event("input", { bubbles: true }));
+  if (active.isConnected) active.dispatchEvent(new Event("change", { bubbles: true }));
+  if (active.isConnected) active.blur();
+}
+
+function hasEditorErrors() {
+  for (const [key, input] of state.editorErrors) {
+    if (!input.isConnected) state.editorErrors.delete(key);
+  }
+  return state.editorErrors.size > 0;
 }
 
 function render() {
   if (!state.config) return;
+  if (state.unsupportedV1) {
+    renderUnsupported();
+    return;
+  }
   renderFlows();
   renderCanvas();
   renderInspector();
@@ -64,595 +130,787 @@ function render() {
   renderSimulationStatus();
 }
 
+function renderUnsupported() {
+  $("#runtime-label").textContent = "Unsupported v1 configuration";
+  $("#flow-list").innerHTML = '<div class="unsupported-card">No v2 flows available</div>';
+  $("#flow-title").textContent = "Flow editor unavailable";
+  $("#flow-structure").textContent = "UNSUPPORTED CONFIGURATION";
+  $("#flow-canvas").innerHTML = '<div class="unsupported-message"><strong>Version 2 flows are required</strong><p>This runtime is using a legacy profile configuration or has no flows. Migrate the configuration to <code>flows</code> before using Flow Lab.</p></div>';
+  $("#inspector-content").innerHTML = '<p class="empty-inspector">Legacy v1 profiles cannot be edited safely in this interface.</p>';
+  ["#add-flow", "#duplicate-flow", "#delete-flow", "#add-ai-step", "#add-gate-step", "#providers-button", "#apply-button", "#run-simulation"].forEach((selector) => { $(selector).disabled = true; });
+  $("#dirty-label").textContent = "";
+}
+
 function renderRuntime() {
   $("#runtime-label").textContent = `Generation ${state.generation} / ${state.persisted ? "saved to YAML" : "runtime only"}`;
-  $("#apply-button").disabled = !state.dirty;
+  $("#apply-button").disabled = !state.dirty || state.applying || state.simulation.active;
   $("#dirty-label").textContent = state.dirty ? "UNAPPLIED" : "";
 }
 
 function renderFlows() {
   const list = $("#flow-list");
-  list.innerHTML = Object.entries(state.config.profiles).map(([name, profile]) => `
-    <button class="flow-card ${name === state.selectedFlow ? "active" : ""}" data-flow="${esc(name)}" type="button" ${state.simulation.active ? "disabled" : ""}>
-      <span class="flow-glyph">${flowGlyph(profile.strategy)}</span>
-      <span class="flow-name"><strong>${esc(name)}</strong><small>${esc(profile.strategy)}</small></span>
-      ${name === state.config.default_profile ? '<span class="default-tag">LIVE</span>' : ""}
-    </button>`).join("");
+  const flows = Object.entries(state.config.flows || {});
+  list.innerHTML = flows.map(([name, flow]) => {
+    const aiCount = flow.steps.filter((step) => step.type === "ai").length;
+    const gateCount = flow.steps.length - aiCount;
+    return `<button class="flow-card ${name === state.selectedFlow ? "active" : ""}" data-flow="${esc(name)}" type="button" ${state.simulation.active ? "disabled" : ""}>
+      <span class="flow-glyph">${aiCount}<i>/${gateCount}</i></span>
+      <span class="flow-name"><strong>${esc(name)}</strong><small>${flow.steps.length} steps / ${flow.starts.length} routes</small></span>
+      ${name === state.config.default_flow ? '<span class="default-tag">LIVE</span>' : ""}
+    </button>`;
+  }).join("");
   list.querySelectorAll("[data-flow]").forEach((button) => button.addEventListener("click", () => {
-    if (button.dataset.flow !== state.selectedFlow) {
-      state.simulation.events = [];
-      state.simulation.nodeStates = {};
-      state.simulation.message = "";
-      state.simulation.profile = null;
-    }
+    if (button.dataset.flow !== state.selectedFlow) clearSimulationTrace();
     state.selectedFlow = button.dataset.flow;
-    state.selectedTarget = null;
+    state.selectedStep = null;
     render();
   }));
 }
 
-function nodeHtml(target, kind, locator, index = "") {
-  if (!target) return "";
-  const selected = state.selectedTarget && state.selectedTarget.locator === locator && String(state.selectedTarget.index ?? "") === String(index);
-  const runKey = `target:${locator}:${index}`;
-  const run = state.simulation.nodeStates[runKey];
-  return `<button class="node ${kind} ${selected ? "selected" : ""} ${run ? `run-${run.status}` : ""}" data-target="${locator}" data-index="${index}" data-run-key="${runKey}" type="button">
-    ${run ? `<i class="node-run-indicator" title="${esc(run.status)}"></i>` : ""}
-    <span class="node-type">${kind}</span><strong>${esc(target.model || "Choose model")}</strong>
-    <small>${esc(target.provider || "No provider")}${target.family ? ` / ${esc(target.family)}` : ""}</small>
-  </button>`;
+function clearSimulationTrace() {
+  state.simulation.events = [];
+  state.simulation.nodeStates = {};
+  state.simulation.message = "";
+  state.simulation.flow = null;
+  state.simulation.start = null;
 }
 
-function systemNodeHtml(id, title, detail, kind = "system", status = "always") {
-  const selected = state.selectedTarget?.locator === "system" && state.selectedTarget.id === id;
-  const runKey = `system:${id}`;
-  const run = state.simulation.nodeStates[runKey];
-  return `<button class="node ${kind} ${selected ? "selected" : ""} ${run ? `run-${run.status}` : ""}" data-system="${id}" data-run-key="${runKey}" type="button">
+function graphLevels(flow) {
+  const levels = Object.fromEntries(flow.steps.map((step) => [step.id, 0]));
+  const starts = new Set(flow.starts.map((start) => start.step));
+  flow.steps.forEach((step) => { if (!starts.has(step.id)) levels[step.id] = 1; });
+  for (let pass = 0; pass < flow.steps.length; pass += 1) {
+    let changed = false;
+    flow.steps.forEach((step) => step.targets.forEach((target) => {
+      if (target.step === "$return" || levels[target.step] == null) return;
+      const next = Math.max(levels[target.step], levels[step.id] + 1);
+      if (next !== levels[target.step] && next < flow.steps.length) {
+        levels[target.step] = next;
+        changed = true;
+      }
+    }));
+    if (!changed) break;
+  }
+  return levels;
+}
+
+function stepNodeHtml(step, starts) {
+  const selected = state.selectedStep === step.id;
+  const run = state.simulation.nodeStates[`step:${step.id}`];
+  const startTags = starts.filter((start) => start.step === step.id);
+  const detail = step.type === "ai"
+    ? `${step.provider || "No provider"} / ${step.model || "Choose model"}`
+    : `${step.min_success} required / ${step.max_concurrency} concurrent`;
+  return `<button class="graph-node ${step.type} ${selected ? "selected" : ""} ${run ? `run-${run.status}` : ""}" data-step-id="${esc(step.id)}" type="button">
     ${run ? `<i class="node-run-indicator" title="${esc(run.status)}"></i>` : ""}
-    <span class="node-type">${esc(status)}</span><strong>${esc(title)}</strong><small>${esc(detail)}</small>
+    <span class="node-type">${esc(step.type)} STEP</span>
+    <strong>${esc(step.id)}</strong>
+    <small>${esc(detail)}</small>
+    ${startTags.length ? `<span class="start-tags">${startTags.map((start) => `START / ${esc(start.when)}`).join("<br>")}</span>` : ""}
   </button>`;
 }
 
 function renderCanvas() {
-  const profile = currentProfile();
+  const flow = currentFlow();
   const canvas = $("#flow-canvas");
-  const canvasWrap = canvas.parentElement;
-  const scrollLeft = canvasWrap.scrollLeft;
-  const scrollTop = canvasWrap.scrollTop;
-  if (!profile) {
+  const wrap = canvas.parentElement;
+  const scrollLeft = wrap.scrollLeft;
+  const scrollTop = wrap.scrollTop;
+  $("#duplicate-flow").disabled = !flow || state.simulation.active;
+  $("#delete-flow").disabled = !flow || Object.keys(state.config.flows).length <= 1 || state.simulation.active;
+  $("#add-flow").disabled = state.simulation.active;
+  $("#add-ai-step").disabled = !flow || state.simulation.active;
+  $("#add-gate-step").disabled = !flow || state.simulation.active;
+  if (!flow) {
     $("#flow-title").textContent = "Select a flow";
+    $("#flow-structure").textContent = "FLOW STRUCTURE";
     canvas.innerHTML = '<div class="empty-node">Create a flow to begin an experiment.</div>';
     return;
   }
+
   $("#flow-title").textContent = state.selectedFlow;
-  $("#flow-strategy").textContent = `${profile.strategy.toUpperCase()} ACTUAL REQUEST PATH`;
-  $("#duplicate-flow").disabled = false;
-  $("#delete-flow").disabled = Object.keys(state.config.profiles).length <= 1;
-
-  let mainPath = "";
-  let branches = "";
-  if (profile.strategy === "direct") {
-    mainPath = `
-      <div class="stage"><span class="stage-label">1. Route</span>${systemNodeHtml("routing", "Profile resolution", "Direct strategy selected")}</div>
-      <div class="stage"><span class="stage-label">2. Execute</span>${nodeHtml(profile, "aggregator", "profile")}</div>
-      <div class="stage"><span class="stage-label">3. Return</span>${systemNodeHtml("response", "Client response", "No filter, quorum, or enforcement", "response")}</div>`;
-  } else {
-    const collection = profile.strategy === "classic" ? "proposers" : "contributors";
-    const label = profile.strategy === "classic" ? "Proposers" : "Council contributors";
-    const targets = profile[collection] || [];
-    const aggregator = profile.aggregator || {};
-    const enforcement = state.config.tool_enforcement || {};
-    const enforcementDetail = enforcement.enabled
-      ? `Adaptive / up to ${enforcement.max_investigation_calls || 1} via ${(enforcement.investigation_tools || []).join(", ")}`
-      : "Disabled";
-    mainPath = `
-      <div class="stage"><span class="stage-label">1. Route</span>${systemNodeHtml("routing", "Request routing", "Initial MoA turn")}</div>
-      <div class="stage"><span class="stage-label">2. Preflight</span>${systemNodeHtml("enforcement", "Tool preflight", enforcementDetail, enforcement.enabled ? "enforcement" : "system", enforcement.enabled ? "global policy" : "inactive")}</div>
-      <div class="stage"><span class="stage-label">3. Analyze</span>${systemNodeHtml("filter", "Request filter", `${aggregator.model || "No model"} via ${aggregator.provider || "none"}`, "filter", "model call")}</div>
-      <div class="stage wide-stage"><span class="stage-label">4. ${label}</span>
-      ${systemNodeHtml("quorum", "Parallel quorum", `${profile.min_quorum}/${targets.length} required / concurrency ${profile.max_concurrency}`, "system", "orchestration")}
-      ${targets.map((target, index) => nodeHtml(target, "contributor", collection, index)).join("")}
-      <button class="node add-node" data-add-target="${collection}" type="button">+ Add ${profile.strategy === "classic" ? "proposer" : "contributor"}</button></div>
-      <div class="stage"><span class="stage-label">5. Synthesize</span>${nodeHtml(profile.aggregator, "aggregator", "aggregator")}</div>
-      <div class="stage"><span class="stage-label">6. Validate output</span>${systemNodeHtml("output-gate", "Tool-call gate", enforcementDetail, enforcement.enabled ? "enforcement" : "system", enforcement.enabled ? "conditional" : "pass-through")}</div>
-      <div class="stage"><span class="stage-label">7. Return</span>${systemNodeHtml("response", "Client response", profile.strategy === "council" ? "Text response is scored" : "Final aggregator only", "response")}</div>`;
-
-    branches = `<div class="execution-branches">
-      <div class="branch-lane dispatch-lane"><span class="branch-title">Conditional bypass: tool result, recent tool call, delegated investigation, or OpenCode maintenance</span>
-        <div class="branch-nodes">${systemNodeHtml("dispatch-route", "Route bypass", "Skips filter, contributors, and aggregation", "dispatch", "conditional")}
-        ${profile.tool_dispatch ? nodeHtml(profile.tool_dispatch, "dispatch", "tool_dispatch") : systemNodeHtml("dispatch-missing", "No dispatcher", "Conditional turns use the MoA path", "warning", "not configured")}
-        ${systemNodeHtml("dispatch-response", "Client response", "Direct model output", "response")}</div>
-      </div>
-      <div class="branch-lane recovery-lane"><span class="branch-title">Aggregation recovery: only when output has no text and no tool calls</span>
-        <div class="branch-nodes">${systemNodeHtml("empty-check", "Empty output?", "Text and tool calls both absent", "recovery", "conditional")}
-        ${systemNodeHtml("recovery", "Retry aggregator", "Same model / 2x tokens / thinking off", "recovery", "attempt 2")}
-        ${systemNodeHtml("fallback", "Best contribution", "Fallback if retry is still empty", "recovery", "last resort")}</div>
-      </div>
-      <div class="branch-lane limitation-lane"><span class="branch-title">Refinement reality</span>
-        <div class="branch-nodes">${systemNodeHtml("refinement", "No critique/revision round", "Current code has recovery, not semantic refinement", "warning", "not implemented")}</div>
-      </div>
-    </div>`;
-  }
-  canvas.innerHTML = `<div class="execution-map"><div class="pipeline">${mainPath}</div>${branches}</div>`;
-  canvas.querySelectorAll("[data-target]").forEach((button) => button.addEventListener("click", () => {
-    state.selectedTarget = { locator: button.dataset.target, index: button.dataset.index === "" ? null : Number(button.dataset.index) };
+  $("#flow-structure").textContent = `${flow.steps.length} STEPS / ${flow.starts.length} START ROUTES`;
+  const levels = graphLevels(flow);
+  const maxLevel = Math.max(0, ...Object.values(levels));
+  const columns = Array.from({ length: maxLevel + 2 }, () => []);
+  flow.steps.forEach((step) => columns[levels[step.id]].push(step));
+  canvas.innerHTML = `<div class="graph-board" style="--graph-columns:${columns.length}">
+    <svg class="graph-edges" aria-hidden="true"><defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker></defs></svg>
+    <div class="graph-columns">
+      ${columns.map((steps, index) => `<div class="graph-column" data-level="${index}">
+        <span class="column-label">${index === columns.length - 1 ? "TERMINAL" : `STAGE ${index + 1}`}</span>
+        ${steps.map((step) => stepNodeHtml(step, flow.starts)).join("")}
+        ${index === columns.length - 1 ? `<button class="graph-node return ${state.selectedStep === "$return" ? "selected" : ""} ${state.simulation.nodeStates["step:$return"] ? `run-${state.simulation.nodeStates["step:$return"].status}` : ""}" data-step-id="$return" type="button">
+          ${state.simulation.nodeStates["step:$return"] ? `<i class="node-run-indicator" title="${esc(state.simulation.nodeStates["step:$return"].status)}"></i>` : ""}
+          <span class="node-type">RETURN TERMINAL</span><strong>Client response</strong><small>Flow output boundary</small>
+        </button>` : ""}
+      </div>`).join("")}
+    </div>
+  </div>`;
+  canvas.querySelectorAll("[data-step-id]").forEach((button) => button.addEventListener("click", () => {
+    state.selectedStep = button.dataset.stepId;
+    const revealInspector = window.matchMedia("(max-width: 900px)").matches;
     render();
+    if (revealInspector) requestAnimationFrame(() => $(".inspector").scrollIntoView({ behavior: "smooth", block: "start" }));
   }));
-  canvas.querySelectorAll("[data-system]").forEach((button) => button.addEventListener("click", () => {
-    state.selectedTarget = { locator: "system", id: button.dataset.system };
-    render();
-  }));
-  canvas.querySelectorAll("[data-add-target]").forEach((button) => button.addEventListener("click", () => {
-    const collection = button.dataset.addTarget;
-    profile[collection].push(targetTemplate(Object.keys(state.config.providers)[0] || ""));
-    state.selectedTarget = { locator: collection, index: profile[collection].length - 1 };
-    markDirty();
-    render();
-  }));
-  canvasWrap.scrollLeft = scrollLeft;
-  canvasWrap.scrollTop = scrollTop;
+  requestAnimationFrame(drawEdges);
+  wrap.scrollLeft = scrollLeft;
+  wrap.scrollTop = scrollTop;
 }
 
-function profileField(profile, field, value) {
-  if (field === "aliases") profile.aliases = value.split(",").map((item) => item.trim()).filter(Boolean);
-  else if (["min_quorum", "max_concurrency", "proposer_max_tokens", "contributor_max_tokens", "reference_token_budget", "contributor_history_chars", "num_ctx"].includes(field)) profile[field] = value === "" ? null : Number(value);
-  else if (field === "contributor_deadline_seconds") profile[field] = value === "" ? null : Number(value);
-  else if (field === "think") profile[field] = value === "" ? null : value === "true";
-  else if (field === "reasoning_reserve") {
-    profile.reasoning_reserve = Object.fromEntries(value.split(",").map((item) => item.trim()).filter(Boolean).map((item) => {
-      const [family, tokens] = item.split(":");
-      return [family.trim(), Number(tokens)];
-    }));
-  }
-  else profile[field] = value;
-}
-
-function transformStrategy(profile, strategy) {
-  const provider = Object.keys(state.config.providers)[0] || "";
-  profile.strategy = strategy;
-  if (strategy === "direct") {
-    Object.assign(profile, { provider: profile.provider || provider, model: profile.model || "" });
-    delete profile.proposers; delete profile.contributors; delete profile.aggregator; delete profile.tool_dispatch;
-  } else if (strategy === "classic") {
-    delete profile.provider; delete profile.model; delete profile.contributors;
-    profile.proposers = profile.proposers?.length ? profile.proposers : [targetTemplate(provider)];
-    profile.aggregator = profile.aggregator || targetTemplate(provider);
-    profile.min_quorum = Math.min(profile.min_quorum || 1, profile.proposers.length);
-  } else {
-    delete profile.provider; delete profile.model; delete profile.proposers;
-    profile.contributors = profile.contributors?.length >= 3 ? profile.contributors : [
-      { ...targetTemplate(provider), family: "family-a" },
-      { ...targetTemplate(provider), family: "family-b" },
-      { ...targetTemplate(provider), family: "family-c" },
-    ];
-    profile.aggregator = profile.aggregator || targetTemplate(provider);
-    profile.min_quorum = Math.min(Math.max(profile.min_quorum || 1, 1), profile.contributors.length);
-  }
-  state.selectedTarget = null;
+function drawEdges() {
+  const flow = currentFlow();
+  const board = $(".graph-board");
+  const svg = board?.querySelector(".graph-edges");
+  if (!flow || !board || !svg) return;
+  const boardRect = board.getBoundingClientRect();
+  svg.setAttribute("viewBox", `0 0 ${boardRect.width} ${boardRect.height}`);
+  svg.setAttribute("width", boardRect.width);
+  svg.setAttribute("height", boardRect.height);
+  svg.querySelectorAll(".edge").forEach((edge) => edge.remove());
+  const nodes = new Map([...board.querySelectorAll("[data-step-id]")].map((node) => [node.dataset.stepId, node]));
+  flow.steps.forEach((step) => step.targets.forEach((target, index) => {
+    const source = nodes.get(step.id);
+    const destination = nodes.get(target.step);
+    if (!source || !destination) return;
+    const from = source.getBoundingClientRect();
+    const to = destination.getBoundingClientRect();
+    const x1 = from.right - boardRect.left;
+    const y1 = from.top + from.height / 2 - boardRect.top + (index - (step.targets.length - 1) / 2) * 7;
+    const x2 = to.left - boardRect.left;
+    const y2 = to.top + to.height / 2 - boardRect.top;
+    const bend = Math.max(26, (x2 - x1) * 0.45);
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("class", `edge edge-${target.when}`);
+    path.setAttribute("d", `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`);
+    path.setAttribute("marker-end", "url(#arrow)");
+    svg.appendChild(path);
+    if (target.when !== "always") {
+      const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      label.setAttribute("class", "edge edge-label");
+      label.setAttribute("x", String((x1 + x2) / 2));
+      label.setAttribute("y", String((y1 + y2) / 2 - 5));
+      label.textContent = target.when.replaceAll("_", " ");
+      svg.appendChild(label);
+    }
+  }));
 }
 
 function renderInspector() {
   const container = $("#inspector-content");
-  const profile = currentProfile();
-  if (!profile) {
-    container.innerHTML = '<p class="empty-inspector">Select a flow to inspect its strategy and model targets.</p>';
+  state.editorErrors.clear();
+  const flow = currentFlow();
+  if (!flow) {
+    container.innerHTML = '<p class="empty-inspector">Select a flow to inspect its routes and steps.</p>';
     return;
   }
-  if (state.selectedTarget?.locator === "system") {
-    renderSystemInspector(container, profile, state.selectedTarget.id);
-    return;
+  if (state.selectedStep === "$return") {
+    renderReturnInspector(container, flow);
+  } else {
+    const step = selectedStep();
+    if (step?.type === "ai") renderAiInspector(container, flow, step);
+    else if (step?.type === "gate") renderGateInspector(container, flow, step);
+    else renderFlowInspector(container, flow);
   }
-  if (state.selectedTarget && state.selectedTarget.locator !== "profile") {
-    renderTargetInspector(container, profile);
-    return;
+  if (state.simulation.active) {
+    container.insertAdjacentHTML("afterbegin", '<p class="inspector-lock">Editing is locked while this simulation is active.</p>');
+    container.querySelectorAll("input, select, textarea, button").forEach((control) => { control.disabled = true; });
   }
-  const direct = profile.strategy === "direct";
+}
+
+function renderFlowInspector(container, flow) {
+  const stepIds = flow.steps.map((step) => step.id);
+  const hasSimpleRouting = flow.starts.some((start) => start.when === "simple_request");
+  const routing = flow.routing || {
+    max_latest_user_chars: 800,
+    max_conversation_chars: 4000,
+    max_messages: 4,
+    require_no_tools: true,
+  };
   container.innerHTML = `
     <h3 class="inspector-title">Flow settings</h3>
     <div class="field"><label>Flow name</label><input id="flow-name-input" value="${esc(state.selectedFlow)}"></div>
-    <div class="field"><label>Public aliases</label><input data-profile-field="aliases" value="${esc((profile.aliases || []).join(", "))}"></div>
-    <div class="field"><span class="field-label">Strategy</span><div class="segmented">
-      ${["direct", "classic", "council"].map((strategy) => `<button type="button" data-strategy="${strategy}" class="${profile.strategy === strategy ? "active" : ""}">${strategy}</button>`).join("")}
-    </div></div>
-    ${direct ? `
-      <hr class="inspector-divider"><h3 class="inspector-title">Direct model</h3>
-      ${providerSelect("provider", profile.provider)}
-      <div class="field"><label>Model ID</label><input data-profile-field="model" list="model-options" value="${esc(profile.model)}"></div>
-      <div class="field-row">
-        <div class="field"><label>Context size</label><input data-profile-field="num_ctx" type="number" min="1" value="${esc(profile.num_ctx ?? "")}"></div>
-        <div class="field"><label>Keep alive</label><input data-profile-field="keep_alive" value="${esc(profile.keep_alive ?? "")}"></div>
-      </div>
-      <div class="field"><label>Thinking</label><select data-profile-field="think"><option value="" ${profile.think == null ? "selected" : ""}>Provider default</option><option value="true" ${profile.think === true ? "selected" : ""}>Enabled</option><option value="false" ${profile.think === false ? "selected" : ""}>Disabled</option></select></div>` : `
-      <div class="field-row">
-        <div class="field"><label>Minimum quorum</label><input data-profile-field="min_quorum" type="number" min="1" value="${esc(profile.min_quorum)}"></div>
-        <div class="field"><label>Concurrency</label><input data-profile-field="max_concurrency" type="number" min="1" value="${esc(profile.max_concurrency)}"></div>
-      </div>
-      <div class="field"><label>Contributor deadline (seconds)</label><input data-profile-field="contributor_deadline_seconds" type="number" min="0" step="1" value="${esc(profile.contributor_deadline_seconds ?? "")}" placeholder="No deadline"></div>
-      <hr class="inspector-divider"><h3 class="inspector-title">Context and budgets</h3>
-      ${profile.strategy === "classic" ? `<div class="field-row">
-        <div class="field"><label>Proposer max tokens</label><input data-profile-field="proposer_max_tokens" type="number" min="1" value="${esc(profile.proposer_max_tokens)}"></div>
-        <div class="field"><label>Filter max tokens</label><input data-profile-field="contributor_max_tokens" type="number" min="1" value="${esc(profile.contributor_max_tokens)}"></div>
-      </div>` : `<div class="field"><label>Contributor and filter max tokens</label><input data-profile-field="contributor_max_tokens" type="number" min="1" value="${esc(profile.contributor_max_tokens)}"></div><p class="hint">The current backend uses one shared budget for the request-filter call and every council contributor.</p>`}
-      <div class="field"><label>History characters per contributor</label><input data-profile-field="contributor_history_chars" type="number" min="1" value="${esc(profile.contributor_history_chars)}"></div>
-      ${profile.strategy === "classic" ? `<div class="field"><label>Reference token budget</label><input data-profile-field="reference_token_budget" type="number" min="1" value="${esc(profile.reference_token_budget)}"></div>` : '<p class="hint">Council aggregation includes complete contributor answers; reference_token_budget is not used on this path.</p>'}
-      <div class="field"><label>Aggregator reasoning reserve</label><input data-profile-field="reasoning_reserve" value="${esc(Object.entries(profile.reasoning_reserve || {}).map(([family, tokens]) => `${family}:${tokens}`).join(", "))}" placeholder="qwen:4096, gemma:2048"></div>
-      ${profile.strategy === "council" ? `<div class="field"><label>Contributor output format</label><select data-profile-field="contributor_format"><option value="text" ${profile.contributor_format === "text" ? "selected" : ""}>Text</option><option value="json-schema" ${profile.contributor_format === "json-schema" ? "selected" : ""}>Five-perspective JSON schema</option></select></div>` : ""}
-      <p class="hint">Tool policy is fixed by the backend: only the final aggregator may emit client-visible tool calls.</p>
-      <button class="button inspector-action" id="toggle-dispatch" type="button">${profile.tool_dispatch ? "Remove" : "Add"} tool dispatch</button>`}
+    <div class="field"><label>Public aliases</label><input id="flow-aliases" value="${esc(flow.aliases.join(", "))}"></div>
     <hr class="inspector-divider">
-    <button class="button inspector-action" id="make-default" type="button" ${state.config.default_profile === state.selectedFlow ? "disabled" : ""}>${state.config.default_profile === state.selectedFlow ? "Current live default" : "Make default flow"}</button>`;
+    <div class="subheading"><span>START ROUTES</span><button class="mini-button" id="add-start" type="button">+ ADD</button></div>
+    <div class="route-list">
+      ${flow.starts.map((start, index) => `<div class="route-row">
+        <select data-start-step="${index}">${optionList(stepIds, start.step)}</select>
+        <select data-start-when="${index}">${optionList(startConditions, start.when)}</select>
+        <button class="route-remove" data-start-remove="${index}" type="button" ${flow.starts.length <= 1 ? "disabled" : ""}>x</button>
+      </div>`).join("")}
+    </div>
+    ${hasSimpleRouting ? `<div class="subheading"><span>SIMPLE REQUEST LIMITS</span></div>
+    <div class="field"><label>Latest user characters</label><input id="routing-user-chars" type="number" min="1" value="${routing.max_latest_user_chars}"></div>
+    <div class="field"><label>Conversation characters</label><input id="routing-conversation-chars" type="number" min="1" value="${routing.max_conversation_chars}"></div>
+    <div class="field"><label>Message count</label><input id="routing-message-count" type="number" min="1" value="${routing.max_messages}"></div>
+    <label class="toggle-row"><input id="routing-no-tools" type="checkbox" ${routing.require_no_tools ? "checked" : ""}><span>Route only requests without tools</span></label>` : ""}
+    <hr class="inspector-divider">
+    <h3 class="inspector-title compact">Output</h3>
+    <div class="field"><label>Output step</label><select id="output-step">${optionList(stepIds, flow.output.step)}</select></div>
+    <label class="toggle-row"><input id="output-passthrough" type="checkbox" ${flow.output.passthrough_input_on_no_tool_calls ? "checked" : ""}><span>Pass through input when output has no tool calls</span></label>
+    <button class="button inspector-action" id="make-default" type="button" ${state.config.default_flow === state.selectedFlow ? "disabled" : ""}>${state.config.default_flow === state.selectedFlow ? "Current live default" : "Make default flow"}</button>`;
 
-  container.querySelectorAll("[data-profile-field]").forEach((input) => {
-    input.addEventListener("input", () => { profileField(profile, input.dataset.profileField, input.value); markDirty(); });
-    input.addEventListener("change", render);
-  });
-  container.querySelectorAll("[data-strategy]").forEach((button) => button.addEventListener("click", () => {
-    transformStrategy(profile, button.dataset.strategy); markDirty(); render();
-  }));
   $("#flow-name-input").addEventListener("change", (event) => renameFlow(event.target.value.trim()));
-  $("#make-default").addEventListener("click", () => { state.config.default_profile = state.selectedFlow; markDirty(); render(); });
-  const dispatch = $("#toggle-dispatch");
-  if (dispatch) dispatch.addEventListener("click", () => {
-    if (profile.tool_dispatch) delete profile.tool_dispatch;
-    else profile.tool_dispatch = targetTemplate(Object.keys(state.config.providers)[0] || "");
+  $("#flow-aliases").addEventListener("input", (event) => { flow.aliases = parseList(event.target.value); markDirty(); });
+  $("#add-start").addEventListener("click", () => {
+    flow.starts.push({ step: stepIds[0], when: "always" });
     markDirty(); render();
   });
-}
-
-function renderSystemInspector(container, profile, id) {
-  const enforcement = state.config.tool_enforcement || {};
-  const aggregator = profile.aggregator || {};
-  const descriptions = {
-    routing: ["Request routing", profile.strategy === "direct"
-      ? "The selected direct profile calls its model immediately."
-      : "Initial turns enter the MoA path. Tool results, recent assistant tool calls, delegated investigations, and OpenCode maintenance can bypass it."],
-    filter: ["Request filter", `A real non-streaming call to ${aggregator.model || "the aggregator"} on ${aggregator.provider || "an unconfigured provider"}. Its analysis is appended as untrusted context to every contributor and the final aggregator.`],
-    quorum: ["Parallel contribution quorum", "All configured model calls are scheduled, bounded by max_concurrency and the shared deadline. Pending calls are cancelled at the deadline; aggregation starts only when min_quorum responses succeeded."],
-    "output-gate": ["Tool-call output gate", "When the aggregator requests an investigation, its inferred calls are grounded and capped. Text emitted beside those calls is removed."],
-    response: ["Response and scoring", profile.strategy === "council" ? "Text responses score council contributors after aggregation. Tool-call responses skip scoring." : "The final model response is returned with panel usage accounted separately."],
-    "dispatch-route": ["Conditional tool dispatch", "This route bypasses request filtering, contributors, and aggregation. It is selected for tool-result turns, recent assistant tool calls, delegated investigations, and OpenCode maintenance prompts."],
-    "dispatch-missing": ["Tool dispatcher missing", "No direct dispatcher is configured for conditional continuation turns."],
-    "dispatch-response": ["Direct continuation response", "The tool dispatcher output is returned directly to the client."],
-    "empty-check": ["Empty completion check", "Recovery starts only when the aggregator returns neither non-whitespace text nor tool calls."],
-    recovery: ["Aggregation retry", "The same aggregator is called once more. max_tokens is doubled and thinking is forced off. This behavior is currently fixed in code."],
-    fallback: ["Contributor fallback", "If both aggregator attempts are empty, MoA prefers a complete non-empty contribution, then the longest response. An upstream error is raised when none exists."],
-    refinement: ["No semantic refinement stage", "The current gateway does not ask contributors to critique, revise, or rank earlier answers. The second aggregation attempt is empty-output recovery, not refinement."],
-  };
-
-  if (id === "enforcement" || id === "output-gate") {
-    container.innerHTML = `
-      <h3 class="inspector-title">Tool enforcement</h3>
-      <p class="inspector-copy">Global policy used on initial non-direct aggregation turns. The aggregator may request only the investigations it needs, up to the configured maximum.</p>
-      <label class="toggle-row"><input id="enforcement-enabled" type="checkbox" ${enforcement.enabled ? "checked" : ""}><span>Enable enforcement</span></label>
-      <div class="field"><label>Investigation tools, in priority order</label><input data-enforcement-field="investigation_tools" value="${esc((enforcement.investigation_tools || []).join(", "))}" placeholder="task"></div>
-      <div class="field"><label>Maximum delegated investigations</label><input data-enforcement-field="max_investigation_calls" type="number" min="1" max="8" value="${esc(enforcement.max_investigation_calls || 1)}"></div>
-      <p class="hint">The aggregator infers zero or more distinct investigation scopes from missing information in the request. MoA never creates generic scopes.</p>`;
-    $("#enforcement-enabled").addEventListener("change", (event) => {
-      enforcement.enabled = event.target.checked;
-      if (enforcement.enabled && !(enforcement.investigation_tools || []).length) enforcement.investigation_tools = ["task"];
-      markDirty(); render();
-    });
-    container.querySelectorAll("[data-enforcement-field]").forEach((input) => input.addEventListener("input", () => {
-      const field = input.dataset.enforcementField;
-      if (field === "investigation_tools") enforcement[field] = input.value.split(",").map((tool) => tool.trim()).filter(Boolean);
-      else if (field === "max_investigation_calls") enforcement[field] = Number(input.value);
-      else enforcement[field] = input.value;
-      markDirty();
-    }));
-    return;
-  }
-
-  if (id === "quorum") {
-    container.innerHTML = `
-      <h3 class="inspector-title">Parallel contribution quorum</h3>
-      <p class="inspector-copy">All configured targets are scheduled. The gateway waits until they finish or the shared deadline expires, then cancels pending calls and checks quorum.</p>
-      <div class="field-row">
-        <div class="field"><label>Minimum successful</label><input data-profile-field="min_quorum" type="number" min="1" value="${esc(profile.min_quorum)}"></div>
-        <div class="field"><label>Maximum concurrent</label><input data-profile-field="max_concurrency" type="number" min="1" value="${esc(profile.max_concurrency)}"></div>
-      </div>
-      <div class="field"><label>Shared deadline (seconds)</label><input data-profile-field="contributor_deadline_seconds" type="number" min="0" value="${esc(profile.contributor_deadline_seconds ?? "")}" placeholder="No deadline"></div>
-      <div class="field"><label>History characters per call</label><input data-profile-field="contributor_history_chars" type="number" min="1" value="${esc(profile.contributor_history_chars)}"></div>
-      <div class="field"><label>${profile.strategy === "council" ? "Contributor and filter" : "Proposer"} max tokens</label><input data-profile-field="${profile.strategy === "council" ? "contributor_max_tokens" : "proposer_max_tokens"}" type="number" min="1" value="${esc(profile.strategy === "council" ? profile.contributor_max_tokens : profile.proposer_max_tokens)}"></div>`;
-    container.querySelectorAll("[data-profile-field]").forEach((input) => {
-      input.addEventListener("input", () => { profileField(profile, input.dataset.profileField, input.value); markDirty(); });
-      input.addEventListener("change", render);
-    });
-    return;
-  }
-
-  const [title, body] = descriptions[id] || ["Gateway stage", "This stage is part of the current request path."];
-  container.innerHTML = `<h3 class="inspector-title">${esc(title)}</h3><p class="inspector-copy">${esc(body)}</p>
-    ${id === "filter" ? `<div class="fact-card"><span>EXECUTED BY</span><strong>${esc(aggregator.model || "Not configured")}</strong><small>${esc(aggregator.provider || "No provider")}</small></div>
-      <div class="field"><label>Filter maximum tokens</label><input data-profile-field="contributor_max_tokens" type="number" min="1" value="${esc(profile.contributor_max_tokens)}"></div>
-      <button class="button inspector-action" id="inspect-aggregator" type="button">Inspect shared aggregator target</button>` : ""}`;
-  container.querySelectorAll("[data-profile-field]").forEach((input) => input.addEventListener("input", () => {
-    profileField(profile, input.dataset.profileField, input.value); markDirty();
+  container.querySelectorAll("[data-start-step]").forEach((input) => input.addEventListener("change", () => {
+    flow.starts[Number(input.dataset.startStep)].step = input.value; markDirty(); render();
   }));
-  const inspect = $("#inspect-aggregator");
-  if (inspect) inspect.addEventListener("click", () => { state.selectedTarget = { locator: "aggregator", index: null }; render(); });
+  container.querySelectorAll("[data-start-when]").forEach((input) => input.addEventListener("change", () => {
+    flow.starts[Number(input.dataset.startWhen)].when = input.value;
+    if (input.value === "simple_request" && !flow.routing) flow.routing = clone(routing);
+    markDirty(); render();
+  }));
+  container.querySelectorAll("[data-start-remove]").forEach((button) => button.addEventListener("click", () => {
+    flow.starts.splice(Number(button.dataset.startRemove), 1); markDirty(); render();
+  }));
+  $("#output-step").addEventListener("change", (event) => { flow.output.step = event.target.value; markDirty(); render(); });
+  $("#output-passthrough").addEventListener("change", (event) => { flow.output.passthrough_input_on_no_tool_calls = event.target.checked; markDirty(); });
+  if (hasSimpleRouting) {
+    flow.routing = routing;
+    $("#routing-user-chars").addEventListener("input", (event) => { routing.max_latest_user_chars = Number(event.target.value); markDirty(); });
+    $("#routing-conversation-chars").addEventListener("input", (event) => { routing.max_conversation_chars = Number(event.target.value); markDirty(); });
+    $("#routing-message-count").addEventListener("input", (event) => { routing.max_messages = Number(event.target.value); markDirty(); });
+    $("#routing-no-tools").addEventListener("change", (event) => { routing.require_no_tools = event.target.checked; markDirty(); });
+  }
+  $("#make-default").addEventListener("click", () => { state.config.default_flow = state.selectedFlow; markDirty(); render(); });
 }
 
-function providerSelect(field, selected, target = false) {
-  return `<div class="field"><label>Provider</label><select ${target ? "data-target-field" : "data-profile-field"}="${field}">
-    ${Object.keys(state.config.providers).map((name) => `<option value="${esc(name)}" ${name === selected ? "selected" : ""}>${esc(name)}</option>`).join("")}
-  </select></div>`;
+function targetsHtml(step, flow) {
+  const destinations = [...flow.steps.map((item) => item.id).filter((id) => id !== step.id), "$return"];
+  return `<div class="subheading"><span>TARGETS</span><button class="mini-button" id="add-target" type="button">+ ADD</button></div>
+    <div class="route-list">
+      ${step.targets.map((target, index) => `<div class="route-row">
+        <select data-target-step="${index}">${optionList(destinations, target.step)}</select>
+        <select data-target-when="${index}">${optionList(targetConditions, target.when || "always")}</select>
+        <button class="route-remove" data-target-remove="${index}" type="button">x</button>
+      </div>`).join("") || '<p class="hint route-empty">No outgoing route. This step cannot complete the flow.</p>'}
+    </div>`;
 }
 
-function selectedTarget(profile) {
-  const { locator, index } = state.selectedTarget;
-  return index === null ? profile[locator] : profile[locator][index];
+function bindTargets(container, flow, step) {
+  $("#add-target").addEventListener("click", () => {
+    step.targets.push({ step: "$return", when: "always" }); markDirty(); render();
+  });
+  container.querySelectorAll("[data-target-step]").forEach((input) => input.addEventListener("change", () => {
+    step.targets[Number(input.dataset.targetStep)].step = input.value; markDirty(); render();
+  }));
+  container.querySelectorAll("[data-target-when]").forEach((input) => input.addEventListener("change", () => {
+    step.targets[Number(input.dataset.targetWhen)].when = input.value; markDirty(); render();
+  }));
+  container.querySelectorAll("[data-target-remove]").forEach((button) => button.addEventListener("click", () => {
+    step.targets.splice(Number(button.dataset.targetRemove), 1); markDirty(); render();
+  }));
 }
 
-function renderTargetInspector(container, profile) {
-  const target = selectedTarget(profile);
-  if (!target) { state.selectedTarget = null; renderInspector(); return; }
-  const { locator, index } = state.selectedTarget;
-  const removable = index !== null;
-  const runtimeRole = locator === "aggregator"
-    ? "This target runs the request-filter call, aggregation attempt 1, and the conditional empty-output retry."
-    : locator === "tool_dispatch"
-      ? "This target is called only on continuation and maintenance turns that bypass the MoA panel."
-      : profile.strategy === "council"
-        ? "This target runs one complete five-perspective council response with no client tools."
-        : "This target runs one independent proposal with no client tools.";
+function triStateOptions(value) {
+  return `<option value="" ${value == null ? "selected" : ""}>Provider default</option><option value="true" ${value === true ? "selected" : ""}>Enabled</option><option value="false" ${value === false ? "selected" : ""}>Disabled</option>`;
+}
+
+function renderAiInspector(container, flow, step) {
+  const prompts = Object.keys(state.config.prompts || {});
+  const schemas = Object.keys(state.config.schemas || {});
+  const validators = Object.keys(state.config.tool_validators || {});
+  const gates = ancestorGateIds(flow, step.id);
+  const repair = step.repair;
+  const retry = step.retry;
+  const fallback = step.fallback;
   container.innerHTML = `
-    <h3 class="inspector-title">${esc(locator.replace("_", " "))}${index !== null ? ` ${index + 1}` : ""}</h3>
-    <p class="inspector-copy">${esc(runtimeRole)}</p>
-    ${providerSelect("provider", target.provider, true)}
-    <div class="field"><label>Model ID</label><input data-target-field="model" list="model-options" value="${esc(target.model)}"></div>
+    <div class="inspector-kicker">AI STEP</div><h3 class="inspector-title">${esc(step.id)}</h3>
+    <div class="field"><label>Step ID</label><input id="step-id" value="${esc(step.id)}"></div>
+    <div class="field"><label>Prompt</label><select data-ai-field="prompt">${optionList(prompts, step.prompt, "No linked prompt")}</select></div>
+    <div class="field"><label>Prompt variables (JSON string map)</label><textarea id="prompt-variables" aria-describedby="prompt-variables-error">${esc(JSON.stringify(step.prompt_variables || {}, null, 2))}</textarea><p class="field-error" id="prompt-variables-error"></p></div>
+    <hr class="inspector-divider">
+    <div class="field"><label>Provider</label><select data-ai-field="provider">${optionList(Object.keys(state.config.providers), step.provider)}</select></div>
+    <div class="field"><label>Model ID</label><input data-ai-field="model" list="model-options" value="${esc(step.model)}"></div>
     <button class="button inspector-action" id="discover-models" type="button">Discover models</button>
     <p class="model-result" id="model-result"></p>
-    <hr class="inspector-divider">
-    <div class="field"><label>Role</label><input data-target-field="role" value="${esc(target.role || "general")}"></div>
-    <div class="field"><label>Model family</label><input data-target-field="family" value="${esc(target.family || "")}" placeholder="Required and unique for council contributors"></div>
     <div class="field-row">
-      <div class="field"><label>Temperature</label><input data-target-field="temperature" type="number" min="0" max="2" step="0.1" value="${esc(target.temperature ?? "")}"></div>
-      <div class="field"><label>Context size</label><input data-target-field="num_ctx" type="number" min="1" value="${esc(target.num_ctx ?? "")}"></div>
+      <div class="field"><label>Role</label><input data-ai-field="role" value="${esc(step.role || "general")}"></div>
+      <div class="field"><label>Family</label><input data-ai-field="family" value="${esc(step.family || "")}" placeholder="Optional"></div>
     </div>
-    <div class="field"><label>Keep alive</label><input data-target-field="keep_alive" value="${esc(target.keep_alive ?? "")}" placeholder="Provider default"></div>
-    <div class="field"><label>Thinking</label><select data-target-field="think"><option value="" ${target.think == null ? "selected" : ""}>Provider default</option><option value="true" ${target.think === true ? "selected" : ""}>Enabled</option><option value="false" ${target.think === false ? "selected" : ""}>Disabled</option></select></div>
-    ${removable ? '<hr class="inspector-divider"><button class="remove-target" id="remove-target" type="button">Remove target</button>' : ""}`;
-  container.querySelectorAll("[data-target-field]").forEach((input) => {
-    input.addEventListener("input", () => {
-      let value = input.value;
-      if (["temperature", "num_ctx"].includes(input.dataset.targetField)) value = value === "" ? null : Number(value);
-      if (input.dataset.targetField === "think") value = value === "" ? null : value === "true";
-      if (value === null || value === "") delete target[input.dataset.targetField]; else target[input.dataset.targetField] = value;
-      markDirty();
-    });
-    input.addEventListener("change", render);
-  });
-  $("#discover-models").addEventListener("click", () => discoverModels(target.provider));
-  const remove = $("#remove-target");
-  if (remove) remove.addEventListener("click", () => {
-    profile[locator].splice(index, 1); state.selectedTarget = null; markDirty(); render();
-  });
-}
-
-function selectedRunKey() {
-  if (!state.selectedTarget) return null;
-  if (state.selectedTarget.locator === "system") return `system:${state.selectedTarget.id}`;
-  return `target:${state.selectedTarget.locator}:${state.selectedTarget.index ?? ""}`;
-}
-
-function appendRunOutput() {
-  const key = selectedRunKey();
-  const run = key ? state.simulation.nodeStates[key] : null;
-  if (!run) return;
-  const container = $("#inspector-content");
-  const outputs = run.events.filter((event) =>
-    event.content || event.tool_calls?.length || event.error || event.event === "stage_progress"
-  );
-  const outputHtml = outputs.length ? outputs.map((event) => {
-    const content = event.content ? `<pre>${esc(event.content)}</pre>` : "";
-    const calls = event.tool_calls?.length ? `<pre>${esc(JSON.stringify(event.tool_calls, null, 2))}</pre>` : "";
-    const error = event.error ? `<pre class="error-output">${esc(event.error)}</pre>` : "";
-    const progress = event.event === "stage_progress"
-      ? `<p>${esc(`${event.successes} succeeded / ${event.failures} failed / ${event.pending} pending`)}</p>`
-      : "";
-    return `<div class="run-event-output"><span>${esc(event.event.replaceAll("_", " "))}${event.attempt ? ` / attempt ${event.attempt}` : ""}</span>${content}${calls}${error}${progress}</div>`;
-  }).join("") : '<p class="run-empty">This stage has status events but no model output.</p>';
-  container.insertAdjacentHTML("beforeend", `
+    <div class="field-row">
+      <div class="field"><label>Conversation</label><select data-ai-field="conversation">${optionList(["none", "advisory", "full"], step.conversation || "none")}</select></div>
+      <div class="field"><label>Activation</label><select data-ai-field="activation">${optionList(["single", "first"], step.activation || "single")}</select></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>Max tokens</label><input id="max-tokens" value="${esc(step.max_tokens ?? "")}" placeholder="request or integer"></div>
+      <div class="field"><label>Reasoning reserve</label><input data-number-field="reasoning_reserve" type="number" min="0" value="${esc(step.reasoning_reserve ?? 0)}"></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>Temperature</label><input data-optional-number="temperature" type="number" min="0" max="2" step="0.1" value="${esc(step.temperature ?? "")}"></div>
+      <div class="field"><label>Context size</label><input data-optional-number="num_ctx" type="number" min="1" value="${esc(step.num_ctx ?? "")}"></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>Thinking</label><select id="think-field">${triStateOptions(step.think)}</select></div>
+      <div class="field"><label>Keep alive</label><input id="keep-alive" value="${esc(step.keep_alive ?? "")}" placeholder="Provider default"></div>
+    </div>
+    <div class="field"><label>Response schema</label><select data-ai-field="response_schema">${optionList(schemas, step.response_schema, "None")}</select></div>
     <hr class="inspector-divider">
-    <section class="run-output">
-      <div class="run-output-heading"><span>LIVE RUN</span><strong class="status-${esc(run.status)}">${esc(run.status)}</strong></div>
-      ${outputHtml}
-      <details><summary>Raw trace events (${run.events.length})</summary><pre>${esc(JSON.stringify(run.events, null, 2))}</pre></details>
-    </section>`);
+    <h3 class="inspector-title compact">Tool policy</h3>
+    <div class="field"><label>Mode</label><select data-tools-field="mode">${optionList(["none", "client"], step.tools?.mode || "none")}</select></div>
+    <div class="field-row">
+      <div class="field"><label>Include</label><input data-tools-list="include" value="${esc((step.tools?.include || []).join(", "))}" placeholder="tool-a, tool-b"></div>
+      <div class="field"><label>Exclude</label><input data-tools-list="exclude" value="${esc((step.tools?.exclude || []).join(", "))}" placeholder="tool-a, tool-b"></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>Validator</label><select data-tools-field="validator">${optionList(validators, step.tools?.validator, "None")}</select></div>
+      <div class="field"><label>Max calls</label><input id="tools-max-calls" type="number" min="1" value="${esc(step.tools?.max_calls ?? "")}"></div>
+    </div>
+    <hr class="inspector-divider">
+    <details class="advanced" ${repair ? "open" : ""}><summary>Repair</summary>
+      <label class="toggle-row"><input id="repair-enabled" type="checkbox" ${repair ? "checked" : ""}><span>Enable schema repair</span></label>
+      ${repair ? `<div class="field"><label>Repair prompt</label><select data-repair-field="prompt">${optionList(prompts, repair.prompt)}</select></div><div class="field"><label>Attempts</label><input data-repair-field="attempts" type="number" min="1" max="4" value="${esc(repair.attempts)}"></div>` : ""}
+    </details>
+    <details class="advanced" ${retry ? "open" : ""}><summary>Retry</summary>
+      <label class="toggle-row"><input id="retry-enabled" type="checkbox" ${retry ? "checked" : ""}><span>Retry empty completions</span></label>
+      ${retry ? `<div class="field-row"><div class="field"><label>Attempts</label><input data-retry-number="attempts" type="number" min="1" max="4" value="${esc(retry.attempts)}"></div><div class="field"><label>Token multiplier</label><input data-retry-number="max_tokens_multiplier" type="number" min="0.1" step="0.1" value="${esc(retry.max_tokens_multiplier)}"></div></div><div class="field"><label>Thinking on retry</label><select id="retry-think">${triStateOptions(retry.think)}</select></div>` : ""}
+    </details>
+    <details class="advanced" ${fallback ? "open" : ""}><summary>Fallback</summary>
+      <label class="toggle-row"><input id="fallback-enabled" type="checkbox" ${fallback ? "checked" : ""} ${!gates.length ? "disabled" : ""}><span>Use best non-empty gate result</span></label>
+      ${fallback ? `<div class="field"><label>Source gate</label><select data-fallback-field="gate">${optionList(gates, fallback.gate, gates.length ? null : "No ancestor gates")}</select>${gates.includes(fallback.gate) ? "" : '<p class="field-error visible">The configured fallback is not an ancestor of this step.</p>'}</div><div class="field"><label>Strategy</label><select data-fallback-field="strategy">${optionList(["best-nonempty"], fallback.strategy)}</select></div>` : ""}
+    </details>
+    <hr class="inspector-divider">
+    ${targetsHtml(step, flow)}
+    ${linkedPromptHtml(step)}
+    <hr class="inspector-divider"><button class="remove-target" id="delete-step" type="button">Delete step</button>`;
+
+  bindStepId(flow, step);
+  container.querySelectorAll("[data-ai-field]").forEach((input) => input.addEventListener("change", () => {
+    const field = input.dataset.aiField;
+    if (["prompt", "family", "response_schema"].includes(field)) setOptional(step, field, input.value);
+    else step[field] = input.value;
+    markDirty(); render();
+  }));
+  container.querySelectorAll("[data-number-field]").forEach((input) => input.addEventListener("input", () => {
+    step[input.dataset.numberField] = Number(input.value); markDirty();
+  }));
+  container.querySelectorAll("[data-optional-number]").forEach((input) => input.addEventListener("input", () => {
+    setOptional(step, input.dataset.optionalNumber, parseOptionalNumber(input.value)); markDirty();
+  }));
+  $("#prompt-variables").addEventListener("input", (event) => validatePromptVariables(step, event.target));
+  $("#max-tokens").addEventListener("change", (event) => { setOptional(step, "max_tokens", parseMaxTokens(event.target.value)); markDirty(); render(); });
+  $("#think-field").addEventListener("change", (event) => { setOptional(step, "think", event.target.value === "" ? null : event.target.value === "true"); markDirty(); render(); });
+  $("#keep-alive").addEventListener("change", (event) => {
+    const value = event.target.value.trim();
+    const parsed = value !== "" && Number.isFinite(Number(value)) ? Number(value) : value;
+    setOptional(step, "keep_alive", parsed); markDirty(); render();
+  });
+  step.tools ||= { mode: "none", include: [], exclude: [] };
+  container.querySelectorAll("[data-tools-field]").forEach((input) => input.addEventListener("change", () => {
+    setOptional(step.tools, input.dataset.toolsField, input.value); markDirty(); render();
+  }));
+  container.querySelectorAll("[data-tools-list]").forEach((input) => input.addEventListener("input", () => {
+    step.tools[input.dataset.toolsList] = parseList(input.value); markDirty();
+  }));
+  $("#tools-max-calls").addEventListener("change", (event) => { setOptional(step.tools, "max_calls", parseOptionalNumber(event.target.value)); markDirty(); render(); });
+  $("#discover-models").addEventListener("click", () => discoverModels(step.provider));
+  bindOptionalConfigs(container, step, prompts, gates);
+  bindTargets(container, flow, step);
+  bindLinkedPrompt(container, step);
+  $("#delete-step").addEventListener("click", () => deleteStep(flow, step));
 }
 
-function targetRunKey(event, profile) {
-  if (event.stage === "filter") return "system:filter";
-  if (event.stage === "aggregator") return "target:aggregator:";
-  if (event.stage === "direct") {
-    return profile.strategy === "direct" ? "target:profile:" : "target:tool_dispatch:";
-  }
-  if (!["contributor", "proposer"].includes(event.stage)) return null;
-  if (event.event.startsWith("stage_")) return "system:quorum";
-  const collection = event.stage === "contributor" ? "contributors" : "proposers";
-  const targets = profile[collection] || [];
-  let index = targets.findIndex((target) =>
-    target.model === event.model && target.provider === event.provider
-      && (!event.role || target.role === event.role)
-      && (!event.family || target.family === event.family)
-  );
-  if (index < 0) index = targets.findIndex((target) => target.model === event.model);
-  return index < 0 ? "system:quorum" : `target:${collection}:${index}`;
+function linkedPromptHtml(step) {
+  const prompt = step.prompt && state.config.prompts[step.prompt];
+  if (!prompt) return "";
+  return `<hr class="inspector-divider"><div class="linked-heading"><span>LINKED PROMPT</span><strong>${esc(step.prompt)}</strong></div>
+    <p class="hint">Prompt edits affect every step linked to this prompt.</p>
+    <div class="field"><label>System</label><textarea class="prompt-editor" data-prompt-field="system">${esc(prompt.system)}</textarea></div>
+    <div class="field"><label>Context</label><textarea class="prompt-editor" data-prompt-field="context" placeholder="Optional">${esc(prompt.context || "")}</textarea></div>`;
 }
 
-function simulationEventTarget(event) {
-  const profile = state.config?.profiles[state.simulation.profile];
-  if (!profile) return null;
-  if (event.event === "model_retrying") return "system:recovery";
-  if (event.event === "model_fallback") return "system:fallback";
-  if (event.event === "request_started") return "system:routing";
-  if (["investigation_tool_selected", "investigation_tool_unavailable", "investigation_tool_fallback"].includes(event.event)) return "system:enforcement";
-  if (["investigation_tool_validated", "investigation_tool_missing", "investigation_tool_fanout", "investigation_tool_grounded"].includes(event.event)) return "system:output-gate";
-  if (["request_completed", "request_failed", "simulation_completed", "simulation_failed"].includes(event.event)) return "system:response";
-  if (event.stage) return targetRunKey(event, profile);
-  return null;
+function bindLinkedPrompt(container, step) {
+  container.querySelectorAll("[data-prompt-field]").forEach((input) => input.addEventListener("input", () => {
+    const prompt = state.config.prompts[step.prompt];
+    if (input.dataset.promptField === "system") prompt.system = input.value;
+    else setOptional(prompt, "context", input.value);
+    markDirty();
+  }));
 }
 
-function simulationEventStatus(event) {
-  if (["request_failed", "simulation_failed", "model_failed", "stage_failed", "investigation_tool_missing"].includes(event.event)) return "failed";
-  if (["model_cancelled", "stage_cancelled"].includes(event.event)) return "skipped";
-  if (["request_completed", "simulation_completed", "model_completed", "stage_completed", "investigation_tool_selected", "investigation_tool_validated", "model_fallback"].includes(event.event)) return "complete";
-  return "running";
+function bindOptionalConfigs(container, step, prompts, gates) {
+  $("#repair-enabled").addEventListener("change", (event) => {
+    if (event.target.checked) step.repair = { prompt: prompts[0] || "", attempts: 1 };
+    else delete step.repair;
+    markDirty(); render();
+  });
+  container.querySelectorAll("[data-repair-field]").forEach((input) => input.addEventListener("change", () => {
+    step.repair[input.dataset.repairField] = input.dataset.repairField === "attempts" ? Number(input.value) : input.value; markDirty(); render();
+  }));
+  $("#retry-enabled").addEventListener("change", (event) => {
+    if (event.target.checked) step.retry = { attempts: 1, condition: "empty", max_tokens_multiplier: 2 };
+    else delete step.retry;
+    markDirty(); render();
+  });
+  container.querySelectorAll("[data-retry-number]").forEach((input) => input.addEventListener("input", () => {
+    step.retry[input.dataset.retryNumber] = Number(input.value); markDirty();
+  }));
+  const retryThink = $("#retry-think");
+  if (retryThink) retryThink.addEventListener("change", () => {
+    setOptional(step.retry, "think", retryThink.value === "" ? null : retryThink.value === "true"); markDirty(); render();
+  });
+  $("#fallback-enabled").addEventListener("change", (event) => {
+    if (event.target.checked) step.fallback = { gate: gates[0], strategy: "best-nonempty" };
+    else delete step.fallback;
+    markDirty(); render();
+  });
+  container.querySelectorAll("[data-fallback-field]").forEach((input) => input.addEventListener("change", () => {
+    step.fallback[input.dataset.fallbackField] = input.value; markDirty(); render();
+  }));
 }
 
-function handleSimulationEvent(event) {
-  state.simulation.events.push(event);
-  if (event.request_id) state.simulation.requestId = event.request_id;
-  const key = simulationEventTarget(event);
-  if (key) {
-    const run = state.simulation.nodeStates[key] || { status: "running", events: [] };
-    run.events.push(event);
-    run.status = simulationEventStatus(event);
-    state.simulation.nodeStates[key] = run;
-  }
-  if (event.event === "stage_started" && ["filter", "direct"].includes(event.stage)) {
-    state.simulation.nodeStates["system:routing"] = {
-      status: "complete",
-      events: [...(state.simulation.nodeStates["system:routing"]?.events || []), event],
-    };
-    if (event.stage === "filter" && !state.config.tool_enforcement?.enabled) {
-      state.simulation.nodeStates["system:enforcement"] = { status: "complete", events: [event] };
-    }
-  }
-  if (event.event === "request_completed" && !state.config.tool_enforcement?.enabled) {
-    state.simulation.nodeStates["system:output-gate"] = { status: "complete", events: [event] };
-  }
-  if (event.event === "simulation_started") {
-    state.simulation.message = `Generation ${event.generation} started / request ${event.request_id.slice(0, 8)}`;
-    state.simulation.nodeStates["system:routing"] = { status: "running", events: [event] };
-  } else if (event.event === "stage_progress") {
-    state.simulation.message = `${event.stage}: ${event.successes} complete, ${event.pending} pending`;
-  } else if (event.event === "model_started") {
-    state.simulation.message = `${event.stage}: running ${event.model}`;
-  } else if (event.event === "simulation_completed") {
-    state.simulation.message = event.tool_calls?.length
-      ? `Stopped at client tool boundary / ${event.tool_calls.length} call(s) requested`
-      : `Completed with ${event.usage?.output_tokens || 0} output tokens`;
-  } else if (event.event === "simulation_failed") {
-    state.simulation.message = event.error;
-  }
-  render();
-}
-
-function renderSimulationStatus() {
-  const simulation = state.simulation;
-  const status = $("#simulation-status");
-  const button = $("#run-simulation");
-  if (!status || !button) return;
-  status.classList.toggle("active", simulation.active);
-  status.classList.toggle("failed", Object.values(simulation.nodeStates).some((node) => node.status === "failed"));
-  status.querySelector("span:last-child").textContent = simulation.message || "Runs the real models and streams their trace.";
-  button.textContent = simulation.active ? "Stop run" : "Run flow";
-  button.classList.toggle("active", simulation.active);
-}
-
-async function runSimulation() {
-  if (state.simulation.active) {
-    state.simulation.message = "Stopping run...";
-    state.simulation.controller?.abort();
-    renderSimulationStatus();
-    return;
-  }
-  const input = $("#simulation-input").value.trim();
-  if (!input) {
-    toast("Enter a prompt before running the flow.", true);
-    $("#simulation-input").focus();
-    return;
-  }
-  const controller = new AbortController();
-  state.simulation = {
-    active: true,
-    controller,
-    profile: state.selectedFlow,
-    requestId: null,
-    events: [],
-    nodeStates: {},
-    message: "Connecting to the live gateway...",
-  };
-  state.selectedTarget = { locator: "system", id: "routing" };
-  render();
+function validatePromptVariables(step, input) {
+  const errorElement = $("#prompt-variables-error");
+  const errorKey = `${state.selectedFlow}:${step.id}:prompt_variables`;
   try {
-    const response = await fetch("/api/simulations", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        profile: state.selectedFlow,
-        input,
-        max_tokens: Number($("#simulation-max-tokens").value),
-      }),
-      signal: controller.signal,
-    });
-    if (!response.ok || !response.body) {
-      const payload = await response.json();
-      throw new Error(formatError(payload.detail));
+    const parsed = JSON.parse(input.value || "{}");
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") throw new Error("Expected a JSON object.");
+    const invalidKey = Object.keys(parsed).find((key) => typeof parsed[key] !== "string");
+    if (invalidKey) throw new Error(`Value for ${invalidKey} must be a string.`);
+    step.prompt_variables = parsed;
+    input.removeAttribute("aria-invalid");
+    errorElement.textContent = "";
+    errorElement.classList.remove("visible");
+    state.editorErrors.delete(errorKey);
+    markDirty();
+  } catch (error) {
+    input.setAttribute("aria-invalid", "true");
+    errorElement.textContent = error.message;
+    errorElement.classList.add("visible");
+    state.editorErrors.set(errorKey, input);
+  }
+}
+
+function renderGateInspector(container, flow, step) {
+  container.innerHTML = `
+    <div class="inspector-kicker">GATE STEP</div><h3 class="inspector-title">${esc(step.id)}</h3>
+    <div class="field"><label>Step ID</label><input id="step-id" value="${esc(step.id)}"></div>
+    <div class="field-row">
+      <div class="field"><label>Minimum success</label><input data-gate-number="min_success" type="number" min="1" value="${esc(step.min_success)}"></div>
+      <div class="field"><label>Max concurrency</label><input data-gate-number="max_concurrency" type="number" min="1" value="${esc(step.max_concurrency)}"></div>
+    </div>
+    <div class="field"><label>Deadline seconds</label><input id="gate-deadline" type="number" min="0.1" step="0.1" value="${esc(step.deadline_seconds ?? "")}" placeholder="No deadline"></div>
+    <div class="field"><label>Completion</label><select data-gate-field="completion">${optionList(["all-or-deadline"], step.completion)}</select></div>
+    <div class="field"><label>On failure</label><select data-gate-field="on_failure">${optionList(["fail"], step.on_failure)}</select></div>
+    <hr class="inspector-divider">
+    ${targetsHtml(step, flow)}
+    <hr class="inspector-divider"><button class="remove-target" id="delete-step" type="button">Delete step</button>`;
+  bindStepId(flow, step);
+  container.querySelectorAll("[data-gate-number]").forEach((input) => input.addEventListener("input", () => {
+    step[input.dataset.gateNumber] = Number(input.value); markDirty();
+  }));
+  container.querySelectorAll("[data-gate-field]").forEach((input) => input.addEventListener("change", () => {
+    step[input.dataset.gateField] = input.value; markDirty(); render();
+  }));
+  $("#gate-deadline").addEventListener("change", (event) => { setOptional(step, "deadline_seconds", parseOptionalNumber(event.target.value)); markDirty(); render(); });
+  bindTargets(container, flow, step);
+  $("#delete-step").addEventListener("click", () => deleteStep(flow, step));
+}
+
+function renderReturnInspector(container, flow) {
+  const run = state.simulation.nodeStates["step:$return"];
+  container.innerHTML = `<div class="inspector-kicker">TERMINAL</div><h3 class="inspector-title">Client response</h3>
+    <p class="inspector-copy">Every target to <code>$return</code> exits the graph. The configured output step is <strong>${esc(flow.output.step)}</strong>${flow.output.passthrough_input_on_no_tool_calls ? " and may pass through its input when it emits no tool calls" : ""}.</p>
+    ${run ? '<p class="hint">The latest completed simulation output is shown below.</p>' : ""}`;
+}
+
+function bindStepId(flow, step) {
+  $("#step-id").addEventListener("change", (event) => renameStep(flow, step, event.target.value.trim()));
+}
+
+function renameStep(flow, step, name) {
+  if (!name || name === step.id) return;
+  if (name === "$return" || flow.steps.some((item) => item.id === name)) {
+    toast("Step IDs must be unique and cannot be $return.", true); renderInspector(); return;
+  }
+  const previous = step.id;
+  step.id = name;
+  flow.starts.forEach((start) => { if (start.step === previous) start.step = name; });
+  flow.steps.forEach((item) => {
+    item.targets.forEach((target) => { if (target.step === previous) target.step = name; });
+    if (item.fallback?.gate === previous) item.fallback.gate = name;
+  });
+  const oldPlaceholder = `{{steps.${previous}}}`;
+  const newPlaceholder = `{{steps.${name}}}`;
+  rewriteFlowPromptReferences(flow, oldPlaceholder, newPlaceholder);
+  if (flow.output.step === previous) flow.output.step = name;
+  if (state.simulation.nodeStates[`step:${previous}`]) {
+    state.simulation.nodeStates[`step:${name}`] = state.simulation.nodeStates[`step:${previous}`];
+    delete state.simulation.nodeStates[`step:${previous}`];
+  }
+  state.selectedStep = name;
+  markDirty(); render();
+}
+
+function rewriteFlowPromptReferences(flow, oldPlaceholder, newPlaceholder) {
+  const prompts = state.config.prompts || {};
+  const referenced = new Set(flow.steps.flatMap((item) => [item.prompt, item.repair?.prompt]).filter(Boolean));
+  referenced.forEach((promptId) => {
+    const prompt = prompts[promptId];
+    if (!prompt || ![prompt.system, prompt.context].some((value) => typeof value === "string" && value.includes(oldPlaceholder))) return;
+    const sharedOutsideFlow = Object.entries(state.config.flows).some(([flowName, otherFlow]) => flowName !== state.selectedFlow && otherFlow.steps.some((item) => item.prompt === promptId || item.repair?.prompt === promptId));
+    let targetPrompt = prompt;
+    let targetId = promptId;
+    if (sharedOutsideFlow) {
+      targetId = uniqueId(`${promptId}-${state.selectedFlow}`, Object.keys(prompts));
+      targetPrompt = clone(prompt);
+      prompts[targetId] = targetPrompt;
+      flow.steps.forEach((item) => {
+        if (item.prompt === promptId) item.prompt = targetId;
+        if (item.repair?.prompt === promptId) item.repair.prompt = targetId;
+      });
     }
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const blocks = buffer.split("\n\n");
-      buffer = blocks.pop() || "";
-      for (const block of blocks) {
-        const data = block.split("\n").filter((line) => line.startsWith("data: ")).map((line) => line.slice(6)).join("");
-        if (data) handleSimulationEvent(JSON.parse(data));
+    ["system", "context"].forEach((field) => {
+      if (typeof targetPrompt[field] === "string") targetPrompt[field] = targetPrompt[field].split(oldPlaceholder).join(newPlaceholder);
+    });
+  });
+}
+
+function extendTerminalRoute(source, stepId) {
+  let replaced = false;
+  source.targets = source.targets.map((target) => {
+    if (target.step !== "$return") return target;
+    replaced = true;
+    return { ...target, step: stepId };
+  });
+  if (!replaced) source.targets.push({ step: stepId, when: "always" });
+}
+
+function addAiStep() {
+  const flow = currentFlow();
+  if (!flow) return;
+  const id = uniqueId("ai-step", flow.steps.map((step) => step.id));
+  const step = {
+    id,
+    type: "ai",
+    provider: Object.keys(state.config.providers)[0] || "",
+    model: "",
+    role: "general",
+    conversation: "none",
+    activation: "single",
+    reasoning_reserve: 0,
+    tools: { mode: "none", include: [], exclude: [] },
+    targets: [{ step: "$return", when: "always" }],
+  };
+  const source = selectedStep() || flow.steps.find((item) => item.id === flow.output.step) || flow.steps.at(-1);
+  flow.steps.push(step);
+  if (source && source.id !== id) {
+    const extendsOutput = source.id === flow.output.step;
+    extendTerminalRoute(source, id);
+    if (extendsOutput) {
+      flow.output.step = id;
+      flow.output.passthrough_input_on_no_tool_calls = false;
+    }
+  }
+  else flow.starts.push({ step: id, when: "always" });
+  state.selectedStep = id;
+  markDirty(); render();
+}
+
+function addGateStep() {
+  const flow = currentFlow();
+  if (!flow) return;
+  const source = selectedStep()?.type === "ai" ? selectedStep() : flow.steps.find((item) => item.type === "ai");
+  if (!source) { toast("Add an AI step before adding a gate; gates require an AI source.", true); return; }
+  const targetSteps = new Map(flow.steps.map((item) => [item.id, item]));
+  if (source.targets.some((target) => targetSteps.get(target.step)?.type === "gate")) {
+    toast(`Cannot add a gate: AI step "${source.id}" already directly targets a gate.`, true);
+    return;
+  }
+  if (source.targets.some((target) => target.step === "$return" && (target.when || "always") !== "always")) {
+    toast(`Cannot add a gate: AI step "${source.id}" has a conditional terminal route, but gate sources must be unconditional.`, true);
+    return;
+  }
+  const id = uniqueId("gate", flow.steps.map((step) => step.id));
+  const step = { id, type: "gate", min_success: 1, max_concurrency: 1, completion: "all-or-deadline", on_failure: "fail", targets: [{ step: "$return", when: "always" }] };
+  flow.steps.push(step);
+  const extendsOutput = source.id === flow.output.step;
+  extendTerminalRoute(source, id);
+  if (extendsOutput) {
+    flow.output.step = id;
+    flow.output.passthrough_input_on_no_tool_calls = false;
+  }
+  state.selectedStep = id;
+  markDirty(); render();
+}
+
+function deleteStep(flow, step) {
+  if (flow.steps.length <= 1) { toast("Cannot delete the only step in a flow.", true); return; }
+  if (!confirm(`Delete step "${step.id}"?`)) return;
+  const candidate = clone(flow);
+  const removed = candidate.steps.find((item) => item.id === step.id);
+  const incomingIds = candidate.steps
+    .filter((item) => item.targets.some((target) => target.step === step.id))
+    .map((item) => item.id);
+  const uniqueIncoming = [...new Set(incomingIds)];
+  const terminal = removed.targets.some((target) => target.step === "$return");
+  const startReplacement = removed.targets.filter((target) => target.step !== "$return" && (target.when || "always") === "always");
+
+  if (candidate.starts.some((start) => start.step === step.id) && startReplacement.length !== 1) {
+    toast(`Cannot delete "${step.id}": its start route has no single unconditional successor.`, true);
+    return;
+  }
+  if (candidate.output.step === step.id) {
+    if (terminal && uniqueIncoming.length === 1) candidate.output.step = uniqueIncoming[0];
+    else if (!terminal && startReplacement.length === 1) candidate.output.step = startReplacement[0].step;
+    else {
+      toast(`Cannot delete output step "${step.id}": a unique safe output replacement is not available.`, true);
+      return;
+    }
+  }
+
+  candidate.starts.forEach((start) => {
+    if (start.step === step.id) start.step = startReplacement[0].step;
+  });
+  candidate.steps = candidate.steps.filter((item) => item.id !== step.id);
+  for (const item of candidate.steps) {
+    const nextTargets = [];
+    for (const target of item.targets) {
+      if (target.step !== step.id) {
+        nextTargets.push(target);
+        continue;
+      }
+      if (!removed.targets.length) {
+        toast(`Cannot delete "${step.id}": incoming route from "${item.id}" would become terminal without a return.`, true);
+        return;
+      }
+      for (const replacement of removed.targets) {
+        const incomingWhen = target.when || "always";
+        const outgoingWhen = replacement.when || "always";
+        if (incomingWhen !== "always" && outgoingWhen !== "always" && incomingWhen !== outgoingWhen) {
+          toast(`Cannot delete "${step.id}": conditional routes from "${item.id}" cannot be combined safely.`, true);
+          return;
+        }
+        nextTargets.push({ step: replacement.step, when: incomingWhen === "always" ? outgoingWhen : incomingWhen });
       }
     }
-  } catch (error) {
-    if (error.name === "AbortError") state.simulation.message = "Run stopped by user.";
-    else {
-      state.simulation.message = error.message;
-      toast(error.message, true);
-    }
-  } finally {
-    state.simulation.active = false;
-    state.simulation.controller = null;
-    render();
+    item.targets = nextTargets.filter((target, index, targets) => targets.findIndex((other) => other.step === target.step && other.when === target.when) === index);
+    if (item.fallback?.gate === step.id) delete item.fallback;
   }
+
+  const invalidReason = validateRunnableFlow(candidate);
+  if (invalidReason) {
+    toast(`Cannot delete "${step.id}": ${invalidReason}`, true);
+    return;
+  }
+  state.config.flows[state.selectedFlow] = candidate;
+  state.selectedStep = null;
+  markDirty(); render();
+}
+
+function validateRunnableFlow(flow) {
+  const steps = new Map(flow.steps.map((step) => [step.id, step]));
+  if (!steps.has(flow.output.step)) return "the output would reference a missing step.";
+  if (!flow.starts.length || !flow.starts.some((start) => start.when === "always")) return "the flow would have no ordinary start route.";
+  if (flow.starts.some((start) => !steps.has(start.step))) return "a start route would reference a missing step.";
+  const predecessors = new Map(flow.steps.map((step) => [step.id, new Set()]));
+  for (const source of flow.steps) {
+    const ownedGates = new Set();
+    for (const target of source.targets) {
+      if (target.step === "$return") continue;
+      if (!steps.has(target.step)) return `route from "${source.id}" would reference a missing step.`;
+      predecessors.get(target.step).add(source.id);
+      if (steps.get(target.step).type === "gate") {
+        if ((target.when || "always") !== "always") return `gate "${target.step}" would have a conditional source.`;
+        ownedGates.add(target.step);
+      }
+    }
+    if (ownedGates.size > 1) return `step "${source.id}" would feed multiple gates.`;
+  }
+  for (const gate of flow.steps.filter((item) => item.type === "gate")) {
+    const sourceCount = predecessors.get(gate.id).size;
+    if (!sourceCount) return `gate "${gate.id}" would have no source.`;
+    if (gate.min_success > sourceCount) return `gate "${gate.id}" would require ${gate.min_success} successes from only ${sourceCount} source(s).`;
+  }
+  for (const aiStep of flow.steps.filter((item) => item.type === "ai")) {
+    if (predecessors.get(aiStep.id).size > 1 && aiStep.activation !== "first") return `AI step "${aiStep.id}" would require activation "first" for explicit fan-in.`;
+  }
+  const visiting = new Set();
+  const visited = new Set();
+  let reachesReturn = false;
+  const visit = (stepId) => {
+    if (visiting.has(stepId)) throw new Error(`the flow would contain a cycle at "${stepId}".`);
+    if (visited.has(stepId)) return;
+    visiting.add(stepId);
+    for (const target of steps.get(stepId).targets) {
+      if (target.step === "$return") reachesReturn = true;
+      else visit(target.step);
+    }
+    visiting.delete(stepId);
+    visited.add(stepId);
+  };
+  try {
+    flow.starts.forEach((start) => visit(start.step));
+  } catch (error) {
+    return error.message;
+  }
+  if (visited.size !== steps.size) return "one or more steps would become unreachable.";
+  if (!reachesReturn) return "no reachable route would return a client response.";
+  const returnable = new Map();
+  const canReturn = (stepId) => {
+    if (returnable.has(stepId)) return returnable.get(stepId);
+    const result = steps.get(stepId).targets.some((target) => target.step === "$return" || canReturn(target.step));
+    returnable.set(stepId, result);
+    return result;
+  };
+  if (flow.starts.some((start) => !canReturn(start.step))) return "a start route would no longer reach the return terminal.";
+  return null;
 }
 
 function renameFlow(name) {
   if (!name || name === state.selectedFlow) return;
-  if (state.config.profiles[name]) { toast("A flow with that name already exists.", true); renderInspector(); return; }
+  if (state.config.flows[name]) { toast("A flow with that name already exists.", true); renderInspector(); return; }
   const previous = state.selectedFlow;
-  const entries = Object.entries(state.config.profiles).map(([key, value]) => [key === previous ? name : key, value]);
-  state.config.profiles = Object.fromEntries(entries);
-  if (state.config.default_profile === previous) state.config.default_profile = name;
-  state.selectedFlow = name; markDirty(); render();
+  state.config.flows = Object.fromEntries(Object.entries(state.config.flows).map(([key, value]) => [key === previous ? name : key, value]));
+  if (state.config.default_flow === previous) state.config.default_flow = name;
+  if (Array.isArray(state.config.warmup_flows)) state.config.warmup_flows = state.config.warmup_flows.map((flowName) => flowName === previous ? name : flowName);
+  state.selectedFlow = name;
+  markDirty(); render();
 }
 
 function addFlow() {
-  const base = "new-flow";
-  let name = base; let suffix = 2;
-  while (state.config.profiles[name]) name = `${base}-${suffix++}`;
+  const name = uniqueId("new-flow", Object.keys(state.config.flows));
   const provider = Object.keys(state.config.providers)[0] || "";
-  state.config.profiles[name] = { aliases: [name], strategy: "direct", provider, model: "" };
-  state.selectedFlow = name; state.selectedTarget = null; markDirty(); render();
+  state.config.flows[name] = {
+    aliases: [`${name}-alias`],
+    starts: [{ step: "answer", when: "always" }],
+    output: { step: "answer", passthrough_input_on_no_tool_calls: false },
+    steps: [{ id: "answer", type: "ai", provider, model: "", role: "general", conversation: "full", activation: "single", reasoning_reserve: 0, tools: { mode: "none", include: [], exclude: [] }, targets: [{ step: "$return", when: "always" }] }],
+  };
+  state.selectedFlow = name;
+  state.selectedStep = null;
+  markDirty(); render();
 }
 
 function duplicateFlow() {
-  if (!currentProfile()) return;
-  let name = `${state.selectedFlow}-copy`; let suffix = 2;
-  while (state.config.profiles[name]) name = `${state.selectedFlow}-copy-${suffix++}`;
-  const copied = clone(currentProfile()); copied.aliases = copied.aliases.map((alias) => `${alias}-copy`);
-  state.config.profiles[name] = copied; state.selectedFlow = name; state.selectedTarget = null; markDirty(); render();
+  const flow = currentFlow();
+  if (!flow) return;
+  const name = uniqueId(`${state.selectedFlow}-copy`, Object.keys(state.config.flows));
+  const copied = clone(flow);
+  const usedAliases = Object.entries(state.config.flows).flatMap(([flowName, item]) => [flowName, ...item.aliases]);
+  copied.aliases = [uniqueId(`${name}-alias`, usedAliases)];
+  state.config.flows[name] = copied;
+  state.selectedFlow = name;
+  state.selectedStep = null;
+  markDirty(); render();
 }
 
 function deleteFlow() {
-  if (Object.keys(state.config.profiles).length <= 1 || !currentProfile()) return;
+  if (Object.keys(state.config.flows).length <= 1 || !currentFlow()) return;
   if (!confirm(`Delete flow "${state.selectedFlow}"?`)) return;
-  const wasDefault = state.config.default_profile === state.selectedFlow;
-  delete state.config.profiles[state.selectedFlow];
-  state.selectedFlow = Object.keys(state.config.profiles)[0];
-  if (wasDefault) state.config.default_profile = state.selectedFlow;
-  state.selectedTarget = null; markDirty(); render();
+  const removed = state.selectedFlow;
+  const wasDefault = state.config.default_flow === removed;
+  delete state.config.flows[removed];
+  if (Array.isArray(state.config.warmup_flows)) state.config.warmup_flows = state.config.warmup_flows.filter((flowName) => flowName !== removed);
+  state.selectedFlow = Object.keys(state.config.flows)[0];
+  if (wasDefault) state.config.default_flow = state.selectedFlow;
+  state.selectedStep = null;
+  markDirty(); render();
 }
 
 function openProviders() {
@@ -661,6 +919,7 @@ function openProviders() {
   $("#provider-drawer").classList.add("open");
   $("#provider-drawer").setAttribute("aria-hidden", "false");
 }
+
 function closeProviders() {
   $("#provider-drawer").classList.remove("open");
   $("#provider-drawer").setAttribute("aria-hidden", "true");
@@ -669,15 +928,13 @@ function closeProviders() {
 
 function renderProviders() {
   $("#provider-list").innerHTML = Object.entries(state.config.providers).map(([name, provider]) => `
-    <div class="provider-card" data-provider-card="${esc(name)}">
+    <div class="provider-card">
       <div class="provider-card-heading"><strong>${esc(name)}</strong><div class="provider-actions">
         <button class="mini-button" data-provider-discover="${esc(name)}" type="button">DISCOVER</button>
         <button class="mini-button remove" data-provider-remove="${esc(name)}" type="button">REMOVE</button>
       </div></div>
       <div class="field"><label>Name</label><input data-provider-name="${esc(name)}" value="${esc(name)}"></div>
-      <div class="field"><label>Type</label><select data-provider-field="type" data-provider="${esc(name)}">
-        ${["ollama", "openai", "deepseek", "openai-compatible"].map((kind) => `<option ${provider.type === kind ? "selected" : ""}>${kind}</option>`).join("")}
-      </select></div>
+      <div class="field"><label>Type</label><select data-provider-field="type" data-provider="${esc(name)}">${optionList(["ollama", "openai", "deepseek", "openai-compatible"], provider.type)}</select></div>
       <div class="field"><label>Base URL</label><input data-provider-field="base_url" data-provider="${esc(name)}" value="${esc(provider.base_url || "")}"></div>
       <div class="field-row">
         <div class="field"><label>API key env</label><input data-provider-field="api_key_env" data-provider="${esc(name)}" value="${esc(provider.api_key_env || "")}" placeholder="None"></div>
@@ -687,10 +944,8 @@ function renderProviders() {
     </div>`).join("");
   document.querySelectorAll("[data-provider-field]").forEach((input) => input.addEventListener("input", () => {
     const provider = state.config.providers[input.dataset.provider];
-    let value = input.value;
-    if (input.dataset.providerField === "timeout_seconds") value = Number(value);
-    if (input.dataset.providerField === "api_key_env" && value === "") value = null;
-    provider[input.dataset.providerField] = value; markDirty();
+    const value = input.dataset.providerField === "timeout_seconds" ? Number(input.value) : input.value;
+    setOptional(provider, input.dataset.providerField, value); markDirty();
   }));
   document.querySelectorAll("[data-provider-name]").forEach((input) => input.addEventListener("change", () => renameProvider(input.dataset.providerName, input.value.trim())));
   document.querySelectorAll("[data-provider-remove]").forEach((button) => button.addEventListener("click", () => removeProvider(button.dataset.providerRemove)));
@@ -701,23 +956,23 @@ function renameProvider(previous, name) {
   if (!name || name === previous) return;
   if (state.config.providers[name]) { toast("A provider with that name already exists.", true); renderProviders(); return; }
   state.config.providers = Object.fromEntries(Object.entries(state.config.providers).map(([key, value]) => [key === previous ? name : key, value]));
-  Object.values(state.config.profiles).forEach((profile) => {
-    if (profile.strategy === "direct" && profile.provider === previous) profile.provider = name;
-    if (profile.strategy !== "direct") allTargets(profile).forEach((target) => { if (target.provider === previous) target.provider = name; });
-  });
+  Object.values(state.config.flows).forEach((flow) => flow.steps.forEach((step) => {
+    if (step.type === "ai" && step.provider === previous) step.provider = name;
+  }));
   markDirty(); renderProviders(); render();
 }
 
 function removeProvider(name) {
-  const used = Object.entries(state.config.profiles).filter(([, profile]) => allTargets(profile).some((target) => target.provider === name)).map(([flow]) => flow);
+  const used = Object.entries(state.config.flows).flatMap(([flowName, flow]) => flow.steps
+    .filter((step) => step.type === "ai" && step.provider === name)
+    .map((step) => `${flowName}/${step.id}`));
   if (used.length) { toast(`Provider is used by: ${used.join(", ")}`, true); return; }
   if (Object.keys(state.config.providers).length <= 1) { toast("At least one provider is required.", true); return; }
   delete state.config.providers[name]; markDirty(); renderProviders(); render();
 }
 
 function addProvider() {
-  let name = "provider"; let suffix = 2;
-  while (state.config.providers[name]) name = `provider-${suffix++}`;
+  const name = uniqueId("provider", Object.keys(state.config.providers));
   state.config.providers[name] = { type: "ollama", base_url: "http://127.0.0.1:11434", timeout_seconds: 1800 };
   markDirty(); renderProviders();
 }
@@ -743,6 +998,161 @@ async function discoverModels(provider, resultSelector = "#model-result") {
   }
 }
 
+function selectedRunKey() {
+  return state.selectedStep ? `step:${state.selectedStep}` : null;
+}
+
+function appendRunOutput() {
+  const key = selectedRunKey();
+  const run = key ? state.simulation.nodeStates[key] : null;
+  if (!run) return;
+  const outputs = run.events.filter((event) => event.content || event.tool_calls?.length || event.error || event.event === "gate_progress");
+  const outputHtml = outputs.length ? outputs.map((event) => {
+    const content = event.content ? `<pre>${esc(event.content)}</pre>` : "";
+    const calls = event.tool_calls?.length ? `<pre>${esc(JSON.stringify(event.tool_calls, null, 2))}</pre>` : "";
+    const error = event.error ? `<pre class="error-output">${esc(event.error)}</pre>` : "";
+    const progress = event.event === "gate_progress" ? `<p>${esc(`${event.successes} succeeded / ${event.failures} failed / ${event.pending} pending`)}</p>` : "";
+    return `<div class="run-event-output"><span>${esc(event.event.replaceAll("_", " "))}${event.attempt ? ` / attempt ${event.attempt}` : ""}</span>${content}${calls}${error}${progress}</div>`;
+  }).join("") : '<p class="run-empty">This node has status events but no model output.</p>';
+  $("#inspector-content").insertAdjacentHTML("beforeend", `<hr class="inspector-divider"><section class="run-output">
+    <div class="run-output-heading"><span>LIVE RUN</span><strong class="status-${esc(run.status)}">${esc(run.status)}</strong></div>
+    ${outputHtml}<details><summary>Raw trace events (${run.events.length})</summary><pre>${esc(JSON.stringify(run.events, null, 2))}</pre></details>
+  </section>`);
+}
+
+function simulationEventTarget(event) {
+  const flow = state.config?.flows?.[state.simulation.flow];
+  if (event.event === "simulation_completed") return "step:$return";
+  if (event.node_id && flow?.steps.some((step) => step.id === event.node_id)) return `step:${event.node_id}`;
+  if (event.stage && flow?.steps.some((step) => step.id === event.stage)) return `step:${event.stage}`;
+  if (["request_started", "simulation_started"].includes(event.event)) {
+    const start = state.simulation.start || ordinaryStart(flow);
+    return start ? `step:${start}` : null;
+  }
+  if (["request_completed", "request_failed", "simulation_failed"].includes(event.event)) return "step:$return";
+  return null;
+}
+
+function simulationEventStatus(event) {
+  if (event.event === "step_failed" || event.event.endsWith("_failed") || event.event === "request_failed") return "failed";
+  if (event.event.endsWith("_cancelled")) return "skipped";
+  if (event.event.endsWith("_completed") || event.event === "tool_calls_validated") return "complete";
+  return "running";
+}
+
+function handleSimulationEvent(event) {
+  state.simulation.events.push(event);
+  if (event.request_id) state.simulation.requestId = event.request_id;
+  if (event.event === "flow_started" && event.node_id) {
+    const flow = state.config?.flows?.[state.simulation.flow];
+    if (flow?.steps.some((step) => step.id === event.node_id)) {
+      const actualKey = `step:${event.node_id}`;
+      const provisionalKey = state.simulation.start ? `step:${state.simulation.start}` : null;
+      if (provisionalKey && provisionalKey !== actualKey) delete state.simulation.nodeStates[provisionalKey];
+      state.simulation.start = event.node_id;
+      state.selectedStep = event.node_id;
+    }
+  }
+  const key = simulationEventTarget(event);
+  if (key) {
+    const run = state.simulation.nodeStates[key] || { status: "running", events: [] };
+    run.events.push(event);
+    run.status = simulationEventStatus(event);
+    state.simulation.nodeStates[key] = run;
+  }
+  if (event.event === "simulation_started") {
+    state.simulation.message = `Generation ${event.generation} started / request ${event.request_id.slice(0, 8)}`;
+  } else if (event.event === "flow_started") {
+    state.simulation.message = `Flow started at ${event.node_id}`;
+  } else if (event.event === "gate_progress") {
+    state.simulation.message = `${event.node_id || "gate"}: ${event.successes} complete, ${event.pending} pending`;
+  } else if (event.event === "model_started") {
+    state.simulation.message = `${event.node_id || "model"}: running ${event.model}`;
+  } else if (event.event === "model_retrying") {
+    state.simulation.message = `${event.node_id}: retrying empty completion`;
+  } else if (event.event === "simulation_completed") {
+    state.simulation.message = event.tool_calls?.length
+      ? `Stopped at client tool boundary / ${event.tool_calls.length} call(s) requested`
+      : `Completed with ${event.usage?.output_tokens || 0} output tokens`;
+  } else if (["simulation_failed", "request_failed"].includes(event.event)) {
+    state.simulation.message = event.error;
+  }
+  render();
+}
+
+function renderSimulationStatus() {
+  const simulation = state.simulation;
+  const status = $("#simulation-status");
+  const button = $("#run-simulation");
+  status.classList.toggle("active", simulation.active);
+  status.classList.toggle("failed", Object.values(simulation.nodeStates).some((node) => node.status === "failed"));
+  status.querySelector("span:last-child").textContent = simulation.message || "Runs the real models and streams their trace.";
+  button.textContent = simulation.active ? "Stop run" : "Run flow";
+  button.classList.toggle("active", simulation.active);
+  button.disabled = !currentFlow() || state.applying;
+}
+
+async function runSimulation() {
+  if (state.simulation.active) {
+    state.simulation.message = "Stopping run...";
+    state.simulation.controller?.abort();
+    renderSimulationStatus();
+    return;
+  }
+  commitActiveEditor();
+  if (hasEditorErrors()) { toast("Fix the highlighted inspector value before running the flow.", true); return; }
+  const input = $("#simulation-input").value.trim();
+  if (!input) { toast("Enter a prompt before running the flow.", true); $("#simulation-input").focus(); return; }
+  if (state.dirty) {
+    state.simulation.message = "Applying configuration before run...";
+    renderSimulationStatus();
+    if (!await applyConfig()) {
+      state.simulation.message = "Run cancelled because the configuration could not be applied.";
+      renderSimulationStatus();
+      return;
+    }
+  }
+  const controller = new AbortController();
+  const start = ordinaryStart(currentFlow());
+  state.simulation = { active: true, controller, flow: state.selectedFlow, start, requestId: null, events: [], nodeStates: {}, message: "Connecting to the live gateway..." };
+  if (start) state.simulation.nodeStates[`step:${start}`] = { status: "running", events: [] };
+  state.selectedStep = start || null;
+  render();
+  try {
+    const response = await fetch("/api/simulations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ profile: state.selectedFlow, input, max_tokens: Number($("#simulation-max-tokens").value) }),
+      signal: controller.signal,
+    });
+    if (!response.ok || !response.body) {
+      const payload = await response.json();
+      throw new Error(formatError(payload.detail));
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const blocks = buffer.split("\n\n");
+      buffer = blocks.pop() || "";
+      for (const block of blocks) {
+        const data = block.split("\n").filter((line) => line.startsWith("data: ")).map((line) => line.slice(6)).join("");
+        if (data) handleSimulationEvent(JSON.parse(data));
+      }
+    }
+  } catch (error) {
+    if (error.name === "AbortError") state.simulation.message = "Run stopped by user.";
+    else { state.simulation.message = error.message; toast(error.message, true); }
+  } finally {
+    state.simulation.active = false;
+    state.simulation.controller = null;
+    render();
+  }
+}
+
 function formatError(detail) {
   if (typeof detail === "string") return detail;
   if (Array.isArray(detail)) return detail.map((item) => `${(item.loc || []).slice(1).join(" > ") || "config"}: ${item.msg}`).join("\n");
@@ -750,7 +1160,14 @@ function formatError(detail) {
 }
 
 async function applyConfig() {
-  if (!state.dirty) return;
+  if (state.applying) return false;
+  commitActiveEditor();
+  if (hasEditorErrors()) {
+    toast("Fix the highlighted inspector value before applying configuration.", true);
+    return false;
+  }
+  if (!state.dirty) return true;
+  state.applying = true;
   const button = $("#apply-button");
   button.disabled = true;
   button.querySelector("span").textContent = "Validating...";
@@ -766,13 +1183,27 @@ async function applyConfig() {
     state.generation = payload.generation;
     state.persisted = payload.persisted;
     state.dirty = false;
+    const flows = state.config.flows;
+    if (!flows || !Object.keys(flows).length) {
+      state.unsupportedV1 = true;
+      state.selectedFlow = null;
+    } else if (!flows[state.selectedFlow]) {
+      state.selectedFlow = state.config.default_flow || Object.keys(flows)[0];
+    }
+    if (state.selectedStep !== "$return" && !currentFlow()?.steps.some((step) => step.id === state.selectedStep)) state.selectedStep = null;
     toast(`Generation ${state.generation} is live${state.persisted ? " and saved" : ""}.`);
     render();
+    if ($("#provider-drawer").classList.contains("open")) renderProviders();
+    return true;
   } catch (error) {
     toast(error.message, true);
     button.disabled = false;
+    return false;
   } finally {
+    state.applying = false;
     button.querySelector("span").textContent = "Apply live";
+    renderRuntime();
+    renderSimulationStatus();
   }
 }
 
@@ -782,9 +1213,18 @@ async function initialize() {
     if (!response.ok) throw new Error("Could not load runtime configuration.");
     const payload = await response.json();
     state.config = payload.config;
+    state.config.prompts ||= {};
+    state.config.schemas ||= {};
+    state.config.tool_validators ||= {};
     state.generation = payload.generation;
     state.persisted = payload.persisted;
-    state.selectedFlow = state.config.default_profile || Object.keys(state.config.profiles)[0];
+    const flows = state.config.flows;
+    if (!flows || !Object.keys(flows).length) {
+      state.unsupportedV1 = true;
+      state.selectedFlow = null;
+    } else {
+      state.selectedFlow = state.config.default_flow || Object.keys(flows)[0];
+    }
     render();
   } catch (error) {
     $("#runtime-label").textContent = "Runtime unavailable";
@@ -796,16 +1236,15 @@ async function initialize() {
 $("#add-flow").addEventListener("click", addFlow);
 $("#duplicate-flow").addEventListener("click", duplicateFlow);
 $("#delete-flow").addEventListener("click", deleteFlow);
+$("#add-ai-step").addEventListener("click", addAiStep);
+$("#add-gate-step").addEventListener("click", addGateStep);
 $("#apply-button").addEventListener("click", applyConfig);
 $("#run-simulation").addEventListener("click", runSimulation);
-$("#policy-button").addEventListener("click", () => {
-  state.selectedTarget = { locator: "system", id: "enforcement" };
-  render();
-});
 $("#providers-button").addEventListener("click", openProviders);
 $("#close-providers").addEventListener("click", closeProviders);
 $("#drawer-backdrop").addEventListener("click", closeProviders);
 $("#add-provider").addEventListener("click", addProvider);
+window.addEventListener("resize", drawEdges);
 document.addEventListener("keydown", (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") { event.preventDefault(); applyConfig(); }
   if (event.key === "Escape") closeProviders();

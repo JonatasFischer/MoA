@@ -68,8 +68,11 @@ class GatewayRuntime:
             current = self._gateway.config
             server = current.server.model_copy(deep=True)
             server.tool_enforcement = experiment.tool_enforcement.model_copy(deep=True)
+            server.warmup_flows = list(experiment.warmup_flows)
+            server.warmup_profiles = list(experiment.warmup_profiles)
             updated = GatewayConfig.model_validate(
                 {
+                    "version": experiment.version,
                     "server": server.model_dump(),
                     **experiment.model_dump(by_alias=True),
                 }

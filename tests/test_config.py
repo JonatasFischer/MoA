@@ -199,36 +199,78 @@ def test_council_requires_three_complete_contributors() -> None:
         GatewayConfig.model_validate(raw)
 
 
-def test_council_requires_all_distinct_contributor_families() -> None:
+def test_v2_code_flow_preserves_council_targets_and_gate_contract() -> None:
     config = load_config("moa.yaml")
-    profile = config.profiles["code"]
+    flow = config.flows["code"]
+    steps = flow.step_map
 
-    assert {target.family for target in profile.contributors} == {
-        "qwen",
-        "gemma",
-        "deepseek",
+    assert {steps[name].family for name in (
+        "qwen-council",
+        "gemma-council",
+        "deepseek-council",
+    )} == {
+        "Opus",
+        "Mitos",
+        "fable",
     }
-    assert profile.aggregator.model == "Qwen/Qwen3-Coder-Next-FP8"
-    assert profile.aggregator.think is True
-    assert profile.tool_dispatch.model == "Qwen/Qwen3-Coder-Next-FP8"
-    assert profile.reasoning_reserve == {"qwen": 4096}
+    assert steps["aggregate"].model == "Qwen/Qwen3-Coder-Next-FP8"
+    assert steps["aggregate"].think is True
+    assert steps["integrate-investigation"].model == "Qwen/Qwen3-Coder-Next-FP8"
+    assert steps["aggregate"].reasoning_reserve == 4096
+    assert steps["contributions"].min_success == 2
+    assert steps["contributions"].deadline_seconds == 45
+    assert steps["contributions"].max_concurrency == 3
+    assert steps["investigation-check"].tools.max_calls == 3
 
     broken = config.model_dump(by_alias=True)
-    broken["profiles"]["code"]["contributors"][2]["family"] = "qwen"
-    with pytest.raises(ValidationError, match="distinct non-empty"):
-        GatewayConfig.model_validate(broken)
-
-    assert profile.min_quorum == 2
-    assert profile.contributor_deadline_seconds == 45
-    assert profile.max_concurrency == 3
-    assert profile.contributor_format == "json-schema"
-
-    broken = config.model_dump(by_alias=True)
-    broken["profiles"]["code"]["min_quorum"] = 4
-    with pytest.raises(ValidationError, match="contributor count"):
+    gate = next(
+        step for step in broken["flows"]["code"]["steps"]
+        if step["id"] == "contributions"
+    )
+    gate["min_success"] = 4
+    with pytest.raises(ValidationError, match="min_success exceeds sources"):
         GatewayConfig.model_validate(broken)
 
     broken = config.model_dump(by_alias=True)
-    broken["server"]["warmup_profiles"] = ["missing"]
-    with pytest.raises(ValidationError, match="unknown warmup profile"):
+    broken["server"]["warmup_flows"] = ["missing"]
+    with pytest.raises(ValidationError, match="unknown warmup flow"):
         GatewayConfig.model_validate(broken)
+
+    broken = config.model_dump(by_alias=True)
+    checker = next(
+        step for step in broken["flows"]["code"]["steps"]
+        if step["id"] == "investigation-check"
+    )
+    checker["tools"]["max_calls"] = None
+    with pytest.raises(ValidationError, match="must configure max_calls"):
+        GatewayConfig.model_validate(broken)
+
+
+def test_provider_modalities_require_text_and_unique_values() -> None:
+    with pytest.raises(ValueError, match="must include text"):
+        ProviderConfig.model_validate(
+            {
+                "type": "openai-compatible",
+                "base_url": "http://local.test/v1",
+                "input_modalities": ["image"],
+            }
+        )
+
+    with pytest.raises(ValueError, match="must be unique"):
+        ProviderConfig.model_validate(
+            {
+                "type": "openai-compatible",
+                "base_url": "http://local.test/v1",
+                "input_modalities": ["text", "text"],
+            }
+        )
+
+
+def test_simple_request_start_requires_routing_configuration() -> None:
+    raw = load_config("moa.yaml").model_dump(by_alias=True)
+    raw["flows"]["direct"]["starts"].insert(
+        0, {"step": "answer", "when": "simple_request"}
+    )
+
+    with pytest.raises(ValueError, match="requires routing configuration"):
+        GatewayConfig.model_validate(raw)

@@ -35,7 +35,7 @@ from moa_gateway.protocols import (
     responses_object,
     responses_stream,
 )
-from moa_gateway.provider import Provider, UpstreamError, discover_models
+from moa_gateway.provider import CapabilityError, Provider, UpstreamError, discover_models
 from moa_gateway.runtime import GatewayRuntime
 
 
@@ -108,6 +108,26 @@ def create_app(
             }
         return JSONResponse(body, status_code=502, headers=headers)
 
+    def capability_error(
+        exc: CapabilityError,
+        protocol: str,
+        headers: dict[str, str] | None = None,
+    ) -> JSONResponse:
+        if protocol == "anthropic":
+            body = {
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": str(exc)},
+            }
+        else:
+            body = {
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "unsupported_modality",
+                    "message": str(exc),
+                }
+            }
+        return JSONResponse(body, status_code=400, headers=headers)
+
     def request_context(request: Request) -> tuple[str, str | None, dict[str, str]]:
         request_id = uuid.uuid4().hex
         parent = request.headers.get("x-moa-parent-request-id")
@@ -127,6 +147,8 @@ def create_app(
     ) -> AsyncIterator[StreamEvent] | JSONResponse:
         try:
             first = await anext(events)
+        except CapabilityError as exc:
+            return capability_error(exc, protocol, headers)
         except UpstreamError as exc:
             return upstream_error(exc, protocol, headers)
         except StopAsyncIteration:
@@ -248,7 +270,10 @@ def create_app(
         simulation: SimulationRequest,
     ) -> StreamingResponse:
         try:
-            runtime.config.resolve_profile(simulation.profile)
+            if runtime.config.uses_flows:
+                runtime.config.resolve_flow(simulation.profile)
+            else:
+                runtime.config.resolve_profile(simulation.profile)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="unknown profile") from exc
 
@@ -262,6 +287,17 @@ def create_app(
                     queue.put_nowait(event)
 
                 enforcement = gateway.config.server.tool_enforcement
+                investigation_tools = list(enforcement.investigation_tools)
+                if gateway.config.uses_flows:
+                    _, flow = gateway.config.resolve_flow(simulation.profile)
+                    investigation_tools = sorted(
+                        {
+                            name
+                            for step in flow.steps
+                            if getattr(step, "type", None) == "ai"
+                            for name in step.tools.include
+                        }
+                    )
                 tools = [
                     {
                         "type": "function",
@@ -276,8 +312,8 @@ def create_app(
                             },
                         },
                     }
-                    for name in enforcement.investigation_tools
-                    if enforcement.enabled
+                    for name in investigation_tools
+                    if gateway.config.uses_flows or enforcement.enabled
                 ]
                 canonical = CanonicalRequest(
                     requested_model=simulation.profile,
@@ -354,15 +390,20 @@ def create_app(
     async def models() -> dict[str, Any]:
         data: list[dict[str, Any]] = []
         async with runtime.lease() as gateway:
-            for profile_name, profile in gateway.config.profiles.items():
-                for alias in profile.aliases:
+            configured = (
+                gateway.config.flows
+                if gateway.config.uses_flows
+                else gateway.config.profiles
+            )
+            for configured_name, configured_item in configured.items():
+                for alias in configured_item.aliases:
                     data.append(
                         {
                             "id": alias,
                             "object": "model",
                             "created": 0,
                             "owned_by": "moa-gateway",
-                            "display_name": f"MoA Gateway: {profile_name}",
+                            "display_name": f"MoA Gateway: {configured_name}",
                         }
                     )
         return {"object": "list", "data": data, "has_more": False}
@@ -419,6 +460,8 @@ def create_app(
                 )
             except UpstreamError as exc:
                 return upstream_error(exc, "openai", diagnostic_headers)
+            except CapabilityError as exc:
+                return capability_error(exc, "openai", diagnostic_headers)
             return JSONResponse(
                 chat_completion(result, model), headers=diagnostic_headers
             )
@@ -470,6 +513,8 @@ def create_app(
                 )
             except UpstreamError as exc:
                 return upstream_error(exc, "anthropic", diagnostic_headers)
+            except CapabilityError as exc:
+                return capability_error(exc, "anthropic", diagnostic_headers)
             return JSONResponse(
                 anthropic_message(result, model), headers=diagnostic_headers
             )
@@ -521,6 +566,8 @@ def create_app(
                 )
             except UpstreamError as exc:
                 return upstream_error(exc, "openai", diagnostic_headers)
+            except CapabilityError as exc:
+                return capability_error(exc, "openai", diagnostic_headers)
             return JSONResponse(
                 responses_object(result, model), headers=diagnostic_headers
             )

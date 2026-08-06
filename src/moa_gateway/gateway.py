@@ -15,7 +15,13 @@ from moa_gateway.domain import (
     StreamEvent,
     Usage,
 )
-from moa_gateway.provider import Provider, UpstreamError, create_provider
+from moa_gateway.flow import FlowExecutor
+from moa_gateway.provider import (
+    Provider,
+    UpstreamError,
+    create_provider,
+    validate_request_modalities,
+)
 from moa_gateway.prompts import REQUEST_FILTER_PROMPT
 from moa_gateway.tool_enforcement import (
     get_aggregator_enforcement,
@@ -142,6 +148,9 @@ class Gateway:
             max_bytes=config.server.trace_max_bytes,
             backup_count=config.server.trace_backup_count,
         )
+        self.flow_executor = (
+            FlowExecutor(config, self.providers, self.trace) if config.uses_flows else None
+        )
         self.tool_enforcement = config.server.tool_enforcement
         if self.tool_enforcement.enabled:
             self.trace.record(
@@ -152,6 +161,8 @@ class Gateway:
             )
 
     def public_model(self, request: CanonicalRequest) -> str:
+        if self.flow_executor is not None:
+            return self.flow_executor.public_model(request)
         _, profile = self.config.resolve_profile(request.requested_model)
         return request.requested_model or profile.aliases[0]
 
@@ -164,6 +175,11 @@ class Gateway:
     ) -> Completion:
         request_id = request_id or uuid.uuid4().hex
         self.trace.bind_parent(request_id, parent_request_id)
+        if self.flow_executor is not None:
+            try:
+                return await self.flow_executor.complete(request, request_id)
+            finally:
+                self.trace.clear_parent(request_id)
         self._trace_request_started(request_id, request, stream=False)
         _, profile = self.config.resolve_profile(request.requested_model)
         try:
@@ -293,6 +309,19 @@ class Gateway:
     ) -> AsyncIterator[StreamEvent]:
         request_id = request_id or uuid.uuid4().hex
         self.trace.bind_parent(request_id, parent_request_id)
+        if self.flow_executor is not None:
+            try:
+                yield StreamEvent(progress="executing configured flow")
+                try:
+                    async for event in self.flow_executor.stream(request, request_id):
+                        yield event
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    yield StreamEvent(error=str(exc), done=True)
+            finally:
+                self.trace.clear_parent(request_id)
+            return
         self._trace_request_started(request_id, request, stream=True)
         _, profile = self.config.resolve_profile(request.requested_model)
         progress_emitted = False
@@ -377,6 +406,9 @@ class Gateway:
             final_usage = Usage()
             final_metrics = ProviderMetrics()
             try:
+                validate_request_modalities(
+                    self.config.providers[provider], model, model_request
+                )
                 async for event in self.providers[provider].stream(
                     model, model_request
                 ):
@@ -1231,6 +1263,7 @@ class Gateway:
         role: str | None = None,
     ) -> Completion:
         started = time.perf_counter()
+        validate_request_modalities(self.config.providers[provider], model, request)
         self._trace_model_started(
             request_id,
             stage,
@@ -1509,6 +1542,10 @@ class Gateway:
         return Usage(
             input_tokens=sum(usage.input_tokens for usage in usages),
             output_tokens=sum(usage.output_tokens for usage in usages),
+            cached_input_tokens=sum(usage.cached_input_tokens for usage in usages),
+            reasoning_output_tokens=sum(
+                usage.reasoning_output_tokens for usage in usages
+            ),
         )
 
     @staticmethod
@@ -1522,6 +1559,9 @@ class Gateway:
             ensure_ascii=True,
             separators=(",", ":"),
         )
+        input_tokens = completion.usage.input_tokens
+        if input_tokens == 0:
+            input_tokens = (len(canonical_input) + 3) // 4
         output_tokens = completion.usage.output_tokens
         if output_tokens == 0:
             output = completion.content + json.dumps(
@@ -1529,8 +1569,10 @@ class Gateway:
             )
             output_tokens = (len(output) + 3) // 4
         return Usage(
-            input_tokens=(len(canonical_input) + 3) // 4,
+            input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cached_input_tokens=completion.usage.cached_input_tokens,
+            reasoning_output_tokens=completion.usage.reasoning_output_tokens,
         )
 
     def _validate_council_completion(
@@ -1896,6 +1938,9 @@ class Gateway:
         )
 
     async def warmup(self) -> None:
+        if self.flow_executor is not None:
+            await self.flow_executor.warmup(self.config.server.warmup_flows)
+            return
         targets: list[
             tuple[str, str, bool | None, str | int | float | None, int | None]
         ] = []

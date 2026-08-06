@@ -36,9 +36,9 @@ async def test_flow_lab_and_config_api_are_public(api) -> None:
 
     assert page.status_code == 200
     assert "MoA Flow Lab" in page.text
-    assert "Request filter" in script.text
-    assert "Tool-call gate" in script.text
-    assert "No semantic refinement stage" in script.text
+    assert "data-step-id" in script.text
+    assert "graph-edges" in script.text
+    assert "node_id" in script.text
     assert "runSimulation" in script.text
     assert config.status_code == 200
     assert config.json()["generation"] == 1
@@ -331,35 +331,140 @@ async def test_responses_translation(api) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("path", "body"), [
+    ("/v1/messages", {
+        "model": "claude-moa-code",
+        "max_tokens": 10,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"name": "read", "input_schema": {"type": "object"}}],
+    }),
+    ("/v1/responses", {
+        "model": "moa-code",
+        "input": "hi",
+        "tools": [{"type": "function", "name": "read"}],
+    }),
+])
+async def test_native_tools_are_translated_to_canonical_functions(api, path, body) -> None:
+    client, provider = api
+
+    response = await client.post(path, json=body)
+
+    assert response.status_code == 200
+    assert provider.requests[-1][1].tools[0]["function"]["name"] == "read"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("path", "body"),
     [
         (
+            "/v1/chat/completions",
+            {
+                "model": "moa-code",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe it"},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
+                            },
+                        ],
+                    }
+                ],
+            },
+        ),
+        (
             "/v1/messages",
             {
                 "model": "claude-moa-code",
-                "max_tokens": 10,
-                "messages": [{"role": "user", "content": "hi"}],
-                "tools": [{"name": "read", "input_schema": {"type": "object"}}],
+                "max_tokens": 20,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe it"},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "aW1hZ2U=",
+                                },
+                            },
+                        ],
+                    }
+                ],
             },
         ),
         (
             "/v1/responses",
             {
                 "model": "moa-code",
-                "input": "hi",
-                "tools": [{"type": "function", "name": "read"}],
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "Describe it"},
+                            {
+                                "type": "input_image",
+                                "image_url": "data:image/png;base64,aW1hZ2U=",
+                            },
+                        ],
+                    }
+                ],
             },
         ),
     ],
 )
-async def test_tools_are_rejected_instead_of_dropped(api, path, body) -> None:
+async def test_multimodal_requests_use_canonical_content_blocks(
+    gateway_config, api, path, body
+) -> None:
+    _, provider = api
+    config = gateway_config.model_copy(deep=True)
+    config.providers["local"].input_modalities = ["text", "image"]
+    app = create_app(config, {"local": provider})
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(path, json=body)
+
+    assert response.status_code == 200
+    content = provider.requests[-1][1].messages[-1]["content"]
+    assert content == [
+        {"type": "text", "text": "Describe it"},
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unsupported_modality_returns_client_error(api) -> None:
     client, provider = api
 
-    response = await client.post(path, json=body)
+    response = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "moa-code",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
+                        }
+                    ],
+                }
+            ],
+        },
+    )
 
-    assert response.status_code == 501
-    assert "silently discarded" in response.json()["detail"]
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "unsupported_modality"
     assert provider.requests == []
 
 

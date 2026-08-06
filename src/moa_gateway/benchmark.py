@@ -267,7 +267,10 @@ async def run_benchmark(
     if runs < 1:
         raise ValueError("runs must be at least 1")
     for profile in profiles:
-        config.resolve_profile(profile)
+        if config.uses_flows:
+            config.resolve_flow(profile)
+        else:
+            config.resolve_profile(profile)
 
     gateway = Gateway(config)
     results: list[BenchmarkResult] = []
@@ -275,7 +278,12 @@ async def run_benchmark(
         for run in range(1, runs + 1):
             for case in CASES:
                 for profile_name in profiles:
-                    _, profile = config.resolve_profile(profile_name)
+                    if config.uses_flows:
+                        config.resolve_flow(profile_name)
+                        strategy = profile_name
+                    else:
+                        _, profile = config.resolve_profile(profile_name)
+                        strategy = profile.strategy
                     request = CanonicalRequest(
                         requested_model=profile_name,
                         messages=[{"role": "user", "content": case.prompt}],
@@ -298,7 +306,7 @@ async def run_benchmark(
                         output_tokens = 0
                     result = BenchmarkResult(
                         profile=profile_name,
-                        strategy=profile.strategy,
+                        strategy=strategy,
                         case=case.name,
                         run=run,
                         passed=passed,

@@ -13,3 +13,5 @@ moa-trace.jsonl
 moa-trace.jsonl.*
 .moa.pid
 .env
+.idea/
+benchmark-results*.json

@@ -1,5 +1,12 @@
 # Configurable Mixture-of-Agents Gateway Plan
 
+> Current implementation note: configuration version 2 supersedes the fixed
+> profile/strategy registry described in the original milestones below. Flows are
+> now compiled from configurable `ai` and `gate` steps, and their aliases are exposed
+> as public models. `direct`, `classic`, and `council` survive only as configuration
+> patterns and benchmark names, not core runtime branches. See `README.md` and
+> `moa.yaml` for the implemented schema.
+
 ## Goal
 
 Build a local gateway that appears as one model to Claude Code, OpenCode, and

@@ -14,6 +14,8 @@ from moa_gateway.domain import (
     ProviderMetrics,
     StreamEvent,
     Usage,
+    content_text,
+    request_modalities,
 )
 
 
@@ -22,6 +24,19 @@ class UpstreamError(Exception):
         super().__init__(f"upstream returned HTTP {status_code}: {body}")
         self.status_code = status_code
         self.body = body
+
+
+class CapabilityError(Exception):
+    pass
+
+
+def validate_request_modalities(
+    config: ProviderConfig, model: str, request: CanonicalRequest
+) -> None:
+    unsupported = request_modalities(request) - config.modalities_for(model)
+    if unsupported:
+        names = ", ".join(sorted(unsupported))
+        raise CapabilityError(f"model {model!r} does not support input modalities: {names}")
 
 
 class Provider(Protocol):
@@ -36,6 +51,7 @@ class Provider(Protocol):
 
 class OpenAICompatibleProvider:
     def __init__(self, config: ProviderConfig) -> None:
+        self.config = config
         headers: dict[str, str] = {}
         if config.api_key_env and (api_key := os.getenv(config.api_key_env)):
             headers["Authorization"] = f"Bearer {api_key}"
@@ -90,6 +106,7 @@ class OpenAICompatibleProvider:
         return payload
 
     async def complete(self, model: str, request: CanonicalRequest) -> Completion:
+        validate_request_modalities(self.config, model, request)
         response = await self.client.post(
             "chat/completions", json=self._payload(model, request, stream=False)
         )
@@ -109,6 +126,7 @@ class OpenAICompatibleProvider:
     async def stream(
         self, model: str, request: CanonicalRequest
     ) -> AsyncIterator[StreamEvent]:
+        validate_request_modalities(self.config, model, request)
         usage = Usage()
         finish_reason = "stop"
         saw_done = False
@@ -166,6 +184,7 @@ class DeepSeekProvider(OpenAICompatibleProvider):
 
 class OllamaProvider:
     def __init__(self, config: ProviderConfig) -> None:
+        self.config = config
         self.client = httpx.AsyncClient(
             base_url=config.base_url.rstrip("/") + "/",
             timeout=httpx.Timeout(config.timeout_seconds),
@@ -177,6 +196,25 @@ class OllamaProvider:
         tool_names: dict[str, str] = {}
         for message in messages:
             clean = dict(message)
+            content = clean.get("content")
+            if isinstance(content, list):
+                images: list[str] = []
+                for block in content:
+                    if not isinstance(block, dict) or block.get("type") != "image_url":
+                        continue
+                    image = block.get("image_url")
+                    url = image.get("url") if isinstance(image, dict) else image
+                    if not isinstance(url, str) or not url:
+                        raise CapabilityError("Ollama image input requires a non-empty URL")
+                    if url.startswith("data:"):
+                        try:
+                            url = url.split(",", 1)[1]
+                        except IndexError as exc:
+                            raise CapabilityError("invalid image data URL") from exc
+                    images.append(url)
+                clean["content"] = content_text(content)
+                if images:
+                    clean["images"] = images
             calls = clean.get("tool_calls") or []
             normalized_calls: list[dict[str, Any]] = []
             for call in calls:
@@ -271,6 +309,7 @@ class OllamaProvider:
         return result
 
     async def complete(self, model: str, request: CanonicalRequest) -> Completion:
+        validate_request_modalities(self.config, model, request)
         response = await self.client.post(
             "api/chat", json=self._payload(model, request, stream=False)
         )
@@ -296,6 +335,7 @@ class OllamaProvider:
     async def stream(
         self, model: str, request: CanonicalRequest
     ) -> AsyncIterator[StreamEvent]:
+        validate_request_modalities(self.config, model, request)
         saw_done = False
         async with self.client.stream(
             "POST", "api/chat", json=self._payload(model, request, stream=True)
