@@ -70,10 +70,14 @@ routing:
   max_messages: 4
   require_no_tools: true
 starts:
-- {step: continue, when: tool_continuation}
-- {step: direct-answer, when: simple_request}
-- {step: request-filter, when: always}
+- {step: continue, when: tool_continuation, priority: 10}
+- {step: direct-answer, when: simple_request, priority: 20}
+- {step: request-filter, when: always, priority: 100}
 ```
+
+Start routes form a chain of responsibility. Lower priority numbers are evaluated
+first and the first matching route wins. When priority is omitted, declaration
+order is retained for compatibility.
 
 ### AI Steps
 
@@ -101,7 +105,10 @@ Prompt templates can use:
 - `{{conversation}}`: selected canonical conversation as JSON.
 - `{{tools}}`: client tool names and descriptions.
 - `{{inputs}}`: results that activated the current step.
+- `{{inputs_full}}`: activating completions with text, tool calls, finish reason, and model.
 - `{{steps.<id>}}`: completed output from a named prior step.
+- `{{available_skills}}`: skill names and descriptions advertised by the client.
+- `{{loaded_skills}}`: completed `skill` tool results in the conversation.
 - `{{investigation_results}}`: tool-result content already in the conversation.
 - `{{remaining_investigations}}`: remaining allowance on the current step.
 
@@ -162,48 +169,53 @@ The bundled `code` flow is entirely represented in `moa.yaml`:
 
 ```text
 request-filter
-  -> qwen-council ---------+
-  -> gemma-council --------+-> contributions gate
-  -> deepseek-council -----+       -> aggregate
-                                      | tool call -> return
-                                      | text -> investigation-check
-                                                   | no gap -> return aggregate unchanged
-                                                   | gap -> task tool call
+  -> solution-council ------------+
+  -> architecture-council --------+-> contributions gate -> aggregate
+  -> project-patterns-council -----+                            |
+                                                  action-skill-reinforcement
+                                                    | approved -> return proposal unchanged
+                                                    | missing skill -> skill tool call
+                                                    | evidence gap -> task tool call
 
-tool result -> integrate-investigation -> investigation-check
+skill result -> request-filter (rerun the complete panel with loaded guidance)
+other tool result -> integrate-investigation -> action-skill-reinforcement
 ```
 
-The contributor gate requires two successful responses, permits three concurrent
+The contributor gate requires all three specialized responses, permits three concurrent
 calls, and uses a shared 45-second deadline. Structured council responses are
 validated against `council-response` and repaired once when invalid. Empty
 aggregation retries once with twice the token budget and thinking disabled, then
 falls back to the best non-empty gate result.
 
-## Investigation Check
+## Action And Skill Reinforcement
 
-Investigation is decided by a dedicated output step after aggregation, not by the
-aggregator itself.
+The aggregator proposes an answer or action but cannot return it directly. A dedicated
+terminal reinforcement step receives the complete proposal, the client skill catalog,
+loaded skill results, and previous tool evidence.
 
-The aggregator can use normal client tools but does not receive `task`. For a text
-answer, `investigation-check` receives only configured investigation tools and asks
-whether a material unanswered question could change correctness or implementation.
+When an available skill governs the proposed action and has not been loaded, only a
+`skill` call is returned. Its result starts a new run at `request-filter`, so the panel
+and aggregator regenerate the proposal with the loaded guidance. Skill names are
+validated against the client's `<available_skills>` catalog and already-loaded skills
+cannot be requested again.
 
-When no investigation is needed, the checker's private JSON decision is discarded
-and the aggregate answer is returned unchanged. When investigation is needed, only
-the grounded tool call is returned. The configured validator:
+After skill requirements are satisfied, the same step decides whether a material
+unanswered question could change correctness or implementation. When no reinforcement
+is needed, its private approval is discarded and the proposed completion is returned
+unchanged, preserving tool IDs and arguments. The configured validator:
 
 - requires the tool to exist in the client request;
 - requires a stable call ID and JSON-object arguments;
 - forces `subagent_type: explore` for `task`;
 - prepends the latest user request;
 - always appends the mandatory Stropha evidence contract;
+- validates requested skill names against the advertised catalog;
 - removes private text emitted beside the investigation call;
 - never executes the tool inside MoA.
 
-The client executes the investigation. Its tool result starts a new flow run at
-`integrate-investigation`, whose answer is checked again. The maximum number of
-investigations is mandatory configuration on the checker step; the bundled flow
-uses three. Once exhausted, `task` is no longer exposed to the checker.
+The client executes reinforcement tools. `task` results start at
+`integrate-investigation`; `skill` results rerun the main panel. The maximum combined
+private reinforcement calls is mandatory configuration on the output step.
 
 Normal tool results use the same continuation path, so coding-agent loops do not
 rerun the contributor panel on every read, command, or edit result.

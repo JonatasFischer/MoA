@@ -85,7 +85,7 @@ def _starter_config(model: str) -> dict[str, object]:
         "flows": {
             "code": {
                 "aliases": ["claude-moa-code", "moa-code"],
-                "starts": [{"step": "answer", "when": "always"}],
+                "starts": [{"step": "answer", "when": "always", "priority": 1}],
                 "output": {"step": "answer"},
                 "steps": [
                     {

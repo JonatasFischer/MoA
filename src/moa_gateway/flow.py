@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import time
+import xml.etree.ElementTree as ET
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -37,6 +38,9 @@ OPENCODE_MAINTENANCE_PREFIXES = (
     "Create a new anchored summary from the conversation history.",
 )
 _TEMPLATE_VARIABLE = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+_AVAILABLE_SKILLS = re.compile(
+    r"<available_skills>(.*?)</available_skills>", re.DOTALL
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -713,6 +717,30 @@ class FlowExecutor:
             if run.request.tools
             else "[NOT_IN_CONTEXT]",
             "inputs": input_text,
+            "inputs_full": json.dumps(
+                [
+                    {
+                        "step": item.step_id,
+                        "content": item.completion.content,
+                        "tool_calls": item.completion.tool_calls,
+                        "finish_reason": item.completion.finish_reason,
+                        "model": item.completion.model,
+                    }
+                    for item in successful
+                ],
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ),
+            "available_skills": json.dumps(
+                self._available_skills(run.request),
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ),
+            "loaded_skills": json.dumps(
+                self._loaded_skills(run.request),
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ),
             "investigation_results": json.dumps(
                 [
                     message.get("content", "")
@@ -996,6 +1024,25 @@ class FlowExecutor:
                 value = arguments
             if not isinstance(value, dict):
                 raise UpstreamError(502, f"tool {name!r} arguments must be an object")
+            if name == "skill":
+                skill_name = str(value.get("name") or "").strip()
+                if not skill_name:
+                    raise UpstreamError(502, "skill tool requires a non-empty name")
+                available_skills = {
+                    item["name"] for item in self._available_skills(run.request)
+                }
+                if available_skills and skill_name not in available_skills:
+                    raise UpstreamError(
+                        502, f"step {step.id} requested unknown skill {skill_name!r}"
+                    )
+                loaded_skills = {
+                    item["name"] for item in self._loaded_skills(run.request)
+                }
+                if skill_name in loaded_skills:
+                    raise UpstreamError(
+                        502,
+                        f"step {step.id} requested already loaded skill {skill_name!r}",
+                    )
             if transform := validator.transforms.get(name):
                 value.update(transform.force_arguments)
                 prompt = str(value.get(transform.prompt_field) or "").rstrip()
@@ -1054,8 +1101,19 @@ class FlowExecutor:
 
     @staticmethod
     def _select_start(flow: FlowConfig, request: CanonicalRequest) -> str:
-        for start in flow.starts:
+        starts = sorted(
+            enumerate(flow.starts),
+            key=lambda item: (
+                item[1].priority if item[1].priority is not None else item[0] + 1,
+                item[0],
+            ),
+        )
+        for _, start in starts:
             if start.when == "always":
+                return start.step
+            if start.when == "skill_result" and FlowExecutor._has_named_tool_result(
+                request, "skill"
+            ):
                 return start.step
             if start.when == "investigation_result" and FlowExecutor._has_tool_result(request):
                 return start.step
@@ -1088,13 +1146,26 @@ class FlowExecutor:
 
     @staticmethod
     def _has_tool_result(request: CanonicalRequest) -> bool:
+        return FlowExecutor._has_named_tool_result(request, "task")
+
+    @staticmethod
+    def _has_named_tool_result(request: CanonicalRequest, tool_name: str) -> bool:
         if not request.messages or request.messages[-1].get("role") != "tool":
             return False
-        call_id = request.messages[-1].get("tool_call_id")
-        for message in reversed(request.messages[:-1]):
+        first_tool = len(request.messages) - 1
+        while first_tool >= 0 and request.messages[first_tool].get("role") == "tool":
+            first_tool -= 1
+        call_ids = {
+            str(message.get("tool_call_id") or "")
+            for message in request.messages[first_tool + 1 :]
+        }
+        for message in reversed(request.messages[: first_tool + 1]):
             for call in message.get("tool_calls") or []:
-                if call.get("id") == call_id:
-                    return call.get("function", {}).get("name") == "task"
+                if (
+                    str(call.get("id") or "") in call_ids
+                    and call.get("function", {}).get("name") == tool_name
+                ):
+                    return True
         return False
 
     @staticmethod
@@ -1136,6 +1207,63 @@ class FlowExecutor:
             ),
             "",
         )
+
+    @staticmethod
+    def _available_skills(request: CanonicalRequest) -> list[dict[str, str]]:
+        skills: dict[str, dict[str, str]] = {}
+        for message in request.messages:
+            if message.get("role") != "system":
+                continue
+            content = content_text(message.get("content"))
+            for match in _AVAILABLE_SKILLS.finditer(content):
+                try:
+                    root = ET.fromstring(
+                        f"<available_skills>{match.group(1)}</available_skills>"
+                    )
+                except ET.ParseError:
+                    continue
+                for skill in root.findall("skill"):
+                    name = (skill.findtext("name") or "").strip()
+                    if name:
+                        skills[name] = {
+                            "name": name,
+                            "description": (
+                                skill.findtext("description") or ""
+                            ).strip(),
+                        }
+        return list(skills.values())
+
+    @staticmethod
+    def _loaded_skills(request: CanonicalRequest) -> list[dict[str, str]]:
+        skill_calls: dict[str, str] = {}
+        loaded: dict[str, dict[str, str]] = {}
+        for message in request.messages:
+            for call in message.get("tool_calls") or []:
+                if call.get("function", {}).get("name") != "skill":
+                    continue
+                arguments = call.get("function", {}).get("arguments", "{}")
+                try:
+                    value = (
+                        json.loads(arguments)
+                        if isinstance(arguments, str)
+                        else arguments
+                    )
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(value, dict) and value.get("name") and call.get("id"):
+                    skill_calls[str(call["id"])] = str(value["name"])
+            if message.get("role") != "tool":
+                continue
+            name = skill_calls.get(str(message.get("tool_call_id") or ""))
+            if not name:
+                continue
+            content = message.get("content", "")
+            if not isinstance(content, str):
+                content = json.dumps(
+                    content, ensure_ascii=True, separators=(",", ":")
+                )
+            loaded[name] = {"name": name, "content": content}
+        return list(loaded.values())
 
     @staticmethod
     def _tool_name(tool: dict[str, Any]) -> str:

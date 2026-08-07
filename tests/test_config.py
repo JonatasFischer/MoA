@@ -205,22 +205,30 @@ def test_v2_code_flow_preserves_council_targets_and_gate_contract() -> None:
     steps = flow.step_map
 
     assert {steps[name].family for name in (
-        "qwen-council",
-        "gemma-council",
-        "deepseek-council",
+        "solution-council",
+        "architecture-council",
+        "project-patterns-council",
     )} == {
-        "Opus",
-        "Mitos",
-        "fable",
+        "solution",
+        "architecture",
+        "project_patterns",
     }
     assert steps["aggregate"].model == "Qwen/Qwen3-Coder-Next-FP8"
     assert steps["aggregate"].think is True
     assert steps["integrate-investigation"].model == "Qwen/Qwen3-Coder-Next-FP8"
     assert steps["aggregate"].reasoning_reserve == 4096
-    assert steps["contributions"].min_success == 2
+    assert steps["contributions"].min_success == 3
     assert steps["contributions"].deadline_seconds == 45
     assert steps["contributions"].max_concurrency == 3
-    assert steps["investigation-check"].tools.max_calls == 3
+    reinforcement = steps["action-skill-reinforcement"]
+    assert reinforcement.tools.include == ["task", "skill"]
+    assert reinforcement.tools.max_calls == 4
+    assert reinforcement.activation == "first"
+    assert flow.output.step == "action-skill-reinforcement"
+    assert flow.output.passthrough_input_on_no_tool_calls is True
+    assert next(start for start in flow.starts if start.when == "skill_result").step == (
+        "request-filter"
+    )
 
     broken = config.model_dump(by_alias=True)
     gate = next(
@@ -239,7 +247,7 @@ def test_v2_code_flow_preserves_council_targets_and_gate_contract() -> None:
     broken = config.model_dump(by_alias=True)
     checker = next(
         step for step in broken["flows"]["code"]["steps"]
-        if step["id"] == "investigation-check"
+        if step["id"] == "action-skill-reinforcement"
     )
     checker["tools"]["max_calls"] = None
     with pytest.raises(ValidationError, match="must configure max_calls"):
@@ -273,4 +281,12 @@ def test_simple_request_start_requires_routing_configuration() -> None:
     )
 
     with pytest.raises(ValueError, match="requires routing configuration"):
+        GatewayConfig.model_validate(raw)
+
+
+def test_start_priority_must_be_positive() -> None:
+    raw = load_config("moa.yaml").model_dump(by_alias=True)
+    raw["flows"]["direct"]["starts"][0]["priority"] = 0
+
+    with pytest.raises(ValidationError, match="greater than or equal to 1"):
         GatewayConfig.model_validate(raw)

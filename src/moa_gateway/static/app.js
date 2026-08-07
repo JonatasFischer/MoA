@@ -26,7 +26,7 @@ const esc = (value) => String(value ?? "")
   .replaceAll("&", "&amp;").replaceAll("<", "&lt;")
   .replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 const clone = (value) => JSON.parse(JSON.stringify(value));
-const startConditions = ["always", "investigation_result", "tool_continuation", "opencode_maintenance", "delegated_investigation", "simple_request"];
+const startConditions = ["always", "skill_result", "investigation_result", "tool_continuation", "opencode_maintenance", "delegated_investigation", "simple_request"];
 const targetConditions = ["always", "has_tool_calls", "no_tool_calls"];
 
 function toast(message, error = false) {
@@ -83,7 +83,31 @@ function setOptional(object, field, value) {
 }
 
 function ordinaryStart(flow) {
-  return flow?.starts.find((start) => start.when === "always")?.step || null;
+  return orderedStarts(flow).find((start) => start.when === "always")?.step || null;
+}
+
+function startPriority(start, index) {
+  return start.priority ?? index + 1;
+}
+
+function orderedStarts(flow) {
+  return (flow?.starts || [])
+    .map((start, index) => ({ ...start, priority: startPriority(start, index), declarationIndex: index }))
+    .sort((left, right) => left.priority - right.priority || left.declarationIndex - right.declarationIndex);
+}
+
+function nextStartPriority(flow) {
+  return Math.max(0, ...flow.starts.map((start, index) => startPriority(start, index))) + 1;
+}
+
+function startChainHtml(flow) {
+  const routes = orderedStarts(flow);
+  return `<div class="entry-chain" aria-label="Entry route priority chain">
+    <span class="entry-chain-source">REQUEST</span>
+    ${routes.map((start) => `<span class="entry-chain-arrow">&rarr;</span><span class="entry-chain-route ${start.when === "always" ? "fallback" : ""}">
+      <strong>P${esc(start.priority)}</strong><span>${esc(start.when)}</span><small>${esc(start.step)}</small>
+    </span>`).join("")}
+  </div>`;
 }
 
 function ancestorGateIds(flow, stepId) {
@@ -197,16 +221,16 @@ function graphLevels(flow) {
 function stepNodeHtml(step, starts) {
   const selected = state.selectedStep === step.id;
   const run = state.simulation.nodeStates[`step:${step.id}`];
-  const startTags = starts.filter((start) => start.step === step.id);
+  const startTags = orderedStarts({ starts }).filter((start) => start.step === step.id);
   const detail = step.type === "ai"
-    ? `${step.provider || "No provider"} / ${step.model || "Choose model"}`
+    ? `${step.role || step.family || "AI"} / ${step.provider || "No provider"}`
     : `${step.min_success} required / ${step.max_concurrency} concurrent`;
   return `<button class="graph-node ${step.type} ${selected ? "selected" : ""} ${run ? `run-${run.status}` : ""}" data-step-id="${esc(step.id)}" type="button">
     ${run ? `<i class="node-run-indicator" title="${esc(run.status)}"></i>` : ""}
     <span class="node-type">${esc(step.type)} STEP</span>
     <strong>${esc(step.id)}</strong>
     <small>${esc(detail)}</small>
-    ${startTags.length ? `<span class="start-tags">${startTags.map((start) => `START / ${esc(start.when)}`).join("<br>")}</span>` : ""}
+    ${startTags.length ? `<span class="start-tags">${startTags.map((start) => `P${esc(start.priority)} / START / ${esc(start.when)}`).join("<br>")}</span>` : ""}
   </button>`;
 }
 
@@ -235,6 +259,7 @@ function renderCanvas() {
   const columns = Array.from({ length: maxLevel + 2 }, () => []);
   flow.steps.forEach((step) => columns[levels[step.id]].push(step));
   canvas.innerHTML = `<div class="graph-board" style="--graph-columns:${columns.length}">
+    ${startChainHtml(flow)}
     <svg class="graph-edges" aria-hidden="true"><defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker></defs></svg>
     <div class="graph-columns">
       ${columns.map((steps, index) => `<div class="graph-column" data-level="${index}">
@@ -334,11 +359,13 @@ function renderFlowInspector(container, flow) {
     <hr class="inspector-divider">
     <div class="subheading"><span>START ROUTES</span><button class="mini-button" id="add-start" type="button">+ ADD</button></div>
     <div class="route-list">
-      ${flow.starts.map((start, index) => `<div class="route-row">
-        <select data-start-step="${index}">${optionList(stepIds, start.step)}</select>
-        <select data-start-when="${index}">${optionList(startConditions, start.when)}</select>
-        <button class="route-remove" data-start-remove="${index}" type="button" ${flow.starts.length <= 1 ? "disabled" : ""}>x</button>
+      ${orderedStarts(flow).map((start) => `<div class="route-row start-route-row">
+        <input data-start-priority="${start.declarationIndex}" type="number" min="1" value="${start.priority}" title="Priority">
+        <select data-start-step="${start.declarationIndex}">${optionList(stepIds, start.step)}</select>
+        <select data-start-when="${start.declarationIndex}">${optionList(startConditions, start.when)}</select>
+        <button class="route-remove" data-start-remove="${start.declarationIndex}" type="button" ${flow.starts.length <= 1 ? "disabled" : ""}>x</button>
       </div>`).join("")}
+      <p class="hint route-priority-hint">Lower priority numbers are evaluated first. The first matching route handles the request.</p>
     </div>
     ${hasSimpleRouting ? `<div class="subheading"><span>SIMPLE REQUEST LIMITS</span></div>
     <div class="field"><label>Latest user characters</label><input id="routing-user-chars" type="number" min="1" value="${routing.max_latest_user_chars}"></div>
@@ -354,9 +381,12 @@ function renderFlowInspector(container, flow) {
   $("#flow-name-input").addEventListener("change", (event) => renameFlow(event.target.value.trim()));
   $("#flow-aliases").addEventListener("input", (event) => { flow.aliases = parseList(event.target.value); markDirty(); });
   $("#add-start").addEventListener("click", () => {
-    flow.starts.push({ step: stepIds[0], when: "always" });
+    flow.starts.push({ step: stepIds[0], when: "always", priority: nextStartPriority(flow) });
     markDirty(); render();
   });
+  container.querySelectorAll("[data-start-priority]").forEach((input) => input.addEventListener("change", () => {
+    flow.starts[Number(input.dataset.startPriority)].priority = Number(input.value); markDirty(); render();
+  }));
   container.querySelectorAll("[data-start-step]").forEach((input) => input.addEventListener("change", () => {
     flow.starts[Number(input.dataset.startStep)].step = input.value; markDirty(); render();
   }));
@@ -707,7 +737,7 @@ function addAiStep() {
       flow.output.passthrough_input_on_no_tool_calls = false;
     }
   }
-  else flow.starts.push({ step: id, when: "always" });
+  else flow.starts.push({ step: id, when: "always", priority: nextStartPriority(flow) });
   state.selectedStep = id;
   markDirty(); render();
 }
@@ -878,7 +908,7 @@ function addFlow() {
   const provider = Object.keys(state.config.providers)[0] || "";
   state.config.flows[name] = {
     aliases: [`${name}-alias`],
-    starts: [{ step: "answer", when: "always" }],
+    starts: [{ step: "answer", when: "always", priority: 1 }],
     output: { step: "answer", passthrough_input_on_no_tool_calls: false },
     steps: [{ id: "answer", type: "ai", provider, model: "", role: "general", conversation: "full", activation: "single", reasoning_reserve: 0, tools: { mode: "none", include: [], exclude: [] }, targets: [{ step: "$return", when: "always" }] }],
   };
@@ -1006,13 +1036,14 @@ function appendRunOutput() {
   const key = selectedRunKey();
   const run = key ? state.simulation.nodeStates[key] : null;
   if (!run) return;
-  const outputs = run.events.filter((event) => event.content || event.tool_calls?.length || event.error || event.event === "gate_progress");
+  const outputs = run.events.filter((event) => event.content || event.tool_calls?.length || event.tools?.length || event.error || event.event === "gate_progress");
   const outputHtml = outputs.length ? outputs.map((event) => {
     const content = event.content ? `<pre>${esc(event.content)}</pre>` : "";
     const calls = event.tool_calls?.length ? `<pre>${esc(JSON.stringify(event.tool_calls, null, 2))}</pre>` : "";
+    const tools = event.tools?.length ? `<p>Validated tools: ${esc(event.tools.join(", "))}</p>` : "";
     const error = event.error ? `<pre class="error-output">${esc(event.error)}</pre>` : "";
     const progress = event.event === "gate_progress" ? `<p>${esc(`${event.successes} succeeded / ${event.failures} failed / ${event.pending} pending`)}</p>` : "";
-    return `<div class="run-event-output"><span>${esc(event.event.replaceAll("_", " "))}${event.attempt ? ` / attempt ${event.attempt}` : ""}</span>${content}${calls}${error}${progress}</div>`;
+    return `<div class="run-event-output"><span>${esc(event.event.replaceAll("_", " "))}${event.attempt ? ` / attempt ${event.attempt}` : ""}</span>${content}${calls}${tools}${error}${progress}</div>`;
   }).join("") : '<p class="run-empty">This node has status events but no model output.</p>';
   $("#inspector-content").insertAdjacentHTML("beforeend", `<hr class="inspector-divider"><section class="run-output">
     <div class="run-output-heading"><span>LIVE RUN</span><strong class="status-${esc(run.status)}">${esc(run.status)}</strong></div>
@@ -1070,6 +1101,8 @@ function handleSimulationEvent(event) {
     state.simulation.message = `${event.node_id || "model"}: running ${event.model}`;
   } else if (event.event === "model_retrying") {
     state.simulation.message = `${event.node_id}: retrying empty completion`;
+  } else if (event.event === "tool_calls_validated") {
+    state.simulation.message = `${event.node_id}: validated ${event.tools.join(", ")}`;
   } else if (event.event === "simulation_completed") {
     state.simulation.message = event.tool_calls?.length
       ? `Stopped at client tool boundary / ${event.tool_calls.length} call(s) requested`

@@ -275,8 +275,10 @@ class FlowStartConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     step: str
+    priority: int | None = Field(default=None, ge=1)
     when: Literal[
         "always",
+        "skill_result",
         "investigation_result",
         "tool_continuation",
         "opencode_maintenance",
