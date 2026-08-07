@@ -1027,22 +1027,24 @@ class FlowExecutor:
             if name == "skill":
                 skill_name = str(value.get("name") or "").strip()
                 if not skill_name:
-                    raise UpstreamError(502, "skill tool requires a non-empty name")
+                    self._record_ignored_skill(run, step, "missing_name")
+                    continue
                 available_skills = {
                     item["name"] for item in self._available_skills(run.request)
                 }
                 if available_skills and skill_name not in available_skills:
-                    raise UpstreamError(
-                        502, f"step {step.id} requested unknown skill {skill_name!r}"
+                    self._record_ignored_skill(
+                        run, step, "unknown_skill", skill_name
                     )
+                    continue
                 loaded_skills = {
                     item["name"] for item in self._loaded_skills(run.request)
                 }
                 if skill_name in loaded_skills:
-                    raise UpstreamError(
-                        502,
-                        f"step {step.id} requested already loaded skill {skill_name!r}",
+                    self._record_ignored_skill(
+                        run, step, "already_loaded", skill_name
                     )
+                    continue
             if transform := validator.transforms.get(name):
                 value.update(transform.force_arguments)
                 prompt = str(value.get(transform.prompt_field) or "").rstrip()
@@ -1077,6 +1079,23 @@ class FlowExecutor:
             content=content,
             tool_calls=validated,
             finish_reason="tool_calls",
+        )
+
+    def _record_ignored_skill(
+        self,
+        run: FlowRun,
+        step: AiStepConfig,
+        reason: str,
+        skill_name: str | None = None,
+    ) -> None:
+        self.trace.record(
+            "skill_call_ignored",
+            run.request_id,
+            flow_id=run.plan.name,
+            node_id=step.id,
+            stage=step.id,
+            reason=reason,
+            skill=skill_name,
         )
 
     def _output_completion(

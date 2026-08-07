@@ -330,6 +330,11 @@ prompts:
       a matching tool result, never request an already loaded skill, and never mix a
       skill call with an operational action.
 
+      A skill call must contain exactly {"name": "<catalog-name>"}, where
+      <catalog-name> is copied verbatim from Available skills. A command, topic,
+      description, or invented identifier is never a skill name. If no catalog entry
+      directly matches the proposed action, do not call skill.
+
       After skill requirements are satisfied, determine whether a material unanswered
       repository or external question could change correctness or implementation. If
       so, call only task and emit no text. Do not investigate optional improvements,

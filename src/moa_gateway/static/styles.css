@@ -117,6 +117,13 @@ kbd { font-size: 9px; opacity: .58; margin-left: 12px; }
 .entry-chain-route small { grid-column: 1 / -1; color: var(--muted); font-size: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .entry-chain-route.fallback { border-left-color: var(--orange); }
 .entry-chain-route.fallback strong { color: var(--orange); }
+.continuation-map { position: relative; z-index: 3; margin: -13px 0 32px; padding: 11px 13px 13px; border: 1px dashed #405044; background: rgba(11,14,12,.72); min-width: max-content; }
+.continuation-title { display: block; margin-bottom: 9px; color: var(--green); font-size: 8px; font-weight: 800; letter-spacing: .12em; }
+.continuation-routes { display: grid; gap: 6px; }
+.continuation-route { display: grid; grid-template-columns: minmax(130px, auto) auto 55px auto minmax(130px, auto); gap: 8px; align-items: center; font-size: 8px; }
+.continuation-route strong { color: var(--ink); font-weight: 600; }
+.continuation-arrow { color: var(--muted); text-align: center; }
+.continuation-client { padding: 3px 6px; border: 1px solid var(--green); color: var(--green); text-align: center; font-weight: 800; letter-spacing: .08em; }
 .graph-columns { position: relative; z-index: 2; display: grid; grid-template-columns: repeat(var(--graph-columns), minmax(170px, 1fr)); gap: 56px; align-items: start; }
 .graph-column { display: flex; flex-direction: column; gap: 24px; min-width: 0; }
 .column-label { color: var(--dim); font-size: 8px; letter-spacing: .14em; margin-bottom: 2px; }

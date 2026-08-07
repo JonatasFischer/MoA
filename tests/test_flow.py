@@ -445,7 +445,7 @@ async def test_reinforcement_blocks_action_until_required_skill_is_loaded() -> N
 
 
 @pytest.mark.asyncio
-async def test_reinforcement_rejects_unknown_skill() -> None:
+async def test_reinforcement_ignores_unknown_skill() -> None:
     class UnknownSkillProvider(FlowProvider):
         async def complete(self, model: str, request: CanonicalRequest) -> Completion:
             system = str(request.messages[0].get("content") or "")
@@ -470,17 +470,57 @@ async def test_reinforcement_rejects_unknown_skill() -> None:
 
     gateway = flow_gateway(UnknownSkillProvider())
 
-    with pytest.raises(UpstreamError, match="unknown skill 'missing-skill'"):
-        await gateway.complete(
-            CanonicalRequest(
-                "moa-code",
-                [
-                    {"role": "system", "content": SKILL_CATALOG},
-                    {"role": "user", "content": "change it"},
-                ],
-                tools=[SKILL_TOOL],
-            )
+    result = await gateway.complete(
+        CanonicalRequest(
+            "moa-code",
+            [
+                {"role": "system", "content": SKILL_CATALOG},
+                {"role": "user", "content": "change it"},
+            ],
+            tools=[SKILL_TOOL],
         )
+    )
+
+    assert result.content == "aggregate answer"
+
+
+@pytest.mark.asyncio
+async def test_reinforcement_ignores_skill_call_without_name() -> None:
+    class MalformedSkillProvider(FlowProvider):
+        async def complete(self, model: str, request: CanonicalRequest) -> Completion:
+            system = str(request.messages[0].get("content") or "")
+            if "final blocking reinforcement layer" in system:
+                self.requests.append((model, request))
+                return Completion(
+                    content="",
+                    model=model,
+                    finish_reason="tool_calls",
+                    tool_calls=[
+                        {
+                            "id": "call_skill",
+                            "type": "function",
+                            "function": {
+                                "name": "skill",
+                                "arguments": '{"command":"lab repo create"}',
+                            },
+                        }
+                    ],
+                )
+            return await super().complete(model, request)
+
+    gateway = flow_gateway(MalformedSkillProvider())
+    result = await gateway.complete(
+        CanonicalRequest(
+            "moa-code",
+            [
+                {"role": "system", "content": SKILL_CATALOG},
+                {"role": "user", "content": "create a repository"},
+            ],
+            tools=[SKILL_TOOL],
+        )
+    )
+
+    assert result.content == "aggregate answer"
 
 
 def test_flow_config_rejects_cycles() -> None:

@@ -110,6 +110,41 @@ function startChainHtml(flow) {
   </div>`;
 }
 
+function continuationMapHtml(flow) {
+  const starts = orderedStarts(flow);
+  const reinforcement = flow.steps.find((step) =>
+    step.type === "ai" && ["skill", "task"].some((name) => step.tools?.include?.includes(name))
+  );
+  const routes = [
+    {
+      tool: "skill",
+      source: reinforcement?.id,
+      start: starts.find((item) => item.when === "skill_result"),
+    },
+    {
+      tool: "task",
+      source: reinforcement?.id,
+      start: starts.find((item) => item.when === "investigation_result"),
+    },
+    {
+      tool: "client tool",
+      source: "action step",
+      start: starts.find((item) => item.when === "tool_continuation"),
+    },
+  ].filter((route) => route.source && route.start);
+  if (!routes.length) return "";
+  return `<section class="continuation-map" aria-label="Cross-request continuation loops">
+    <span class="continuation-title">CROSS-REQUEST CONTINUATIONS</span>
+    <div class="continuation-routes">
+      ${routes.map((route) => `<div class="continuation-route">
+        <strong>${esc(route.source)}</strong><span class="continuation-arrow">&rarr; ${esc(route.tool)}</span>
+        <span class="continuation-client">CLIENT</span><span class="continuation-arrow">&rarr; P${esc(route.start.priority)} / ${esc(route.start.when)}</span>
+        <strong>${esc(route.start.step)}</strong>
+      </div>`).join("")}
+    </div>
+  </section>`;
+}
+
 function ancestorGateIds(flow, stepId) {
   const ancestors = new Set();
   const pending = [stepId];
@@ -260,6 +295,7 @@ function renderCanvas() {
   flow.steps.forEach((step) => columns[levels[step.id]].push(step));
   canvas.innerHTML = `<div class="graph-board" style="--graph-columns:${columns.length}">
     ${startChainHtml(flow)}
+    ${continuationMapHtml(flow)}
     <svg class="graph-edges" aria-hidden="true"><defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker></defs></svg>
     <div class="graph-columns">
       ${columns.map((steps, index) => `<div class="graph-column" data-level="${index}">
@@ -1036,14 +1072,15 @@ function appendRunOutput() {
   const key = selectedRunKey();
   const run = key ? state.simulation.nodeStates[key] : null;
   if (!run) return;
-  const outputs = run.events.filter((event) => event.content || event.tool_calls?.length || event.tools?.length || event.error || event.event === "gate_progress");
+  const outputs = run.events.filter((event) => event.content || event.tool_calls?.length || event.tools?.length || event.error || ["gate_progress", "skill_call_ignored"].includes(event.event));
   const outputHtml = outputs.length ? outputs.map((event) => {
     const content = event.content ? `<pre>${esc(event.content)}</pre>` : "";
     const calls = event.tool_calls?.length ? `<pre>${esc(JSON.stringify(event.tool_calls, null, 2))}</pre>` : "";
     const tools = event.tools?.length ? `<p>Validated tools: ${esc(event.tools.join(", "))}</p>` : "";
     const error = event.error ? `<pre class="error-output">${esc(event.error)}</pre>` : "";
     const progress = event.event === "gate_progress" ? `<p>${esc(`${event.successes} succeeded / ${event.failures} failed / ${event.pending} pending`)}</p>` : "";
-    return `<div class="run-event-output"><span>${esc(event.event.replaceAll("_", " "))}${event.attempt ? ` / attempt ${event.attempt}` : ""}</span>${content}${calls}${tools}${error}${progress}</div>`;
+    const ignoredSkill = event.event === "skill_call_ignored" ? `<p>Ignored skill call: ${esc(event.skill || event.reason)}</p>` : "";
+    return `<div class="run-event-output"><span>${esc(event.event.replaceAll("_", " "))}${event.attempt ? ` / attempt ${event.attempt}` : ""}</span>${content}${calls}${tools}${error}${progress}${ignoredSkill}</div>`;
   }).join("") : '<p class="run-empty">This node has status events but no model output.</p>';
   $("#inspector-content").insertAdjacentHTML("beforeend", `<hr class="inspector-divider"><section class="run-output">
     <div class="run-output-heading"><span>LIVE RUN</span><strong class="status-${esc(run.status)}">${esc(run.status)}</strong></div>
@@ -1103,6 +1140,8 @@ function handleSimulationEvent(event) {
     state.simulation.message = `${event.node_id}: retrying empty completion`;
   } else if (event.event === "tool_calls_validated") {
     state.simulation.message = `${event.node_id}: validated ${event.tools.join(", ")}`;
+  } else if (event.event === "skill_call_ignored") {
+    state.simulation.message = `${event.node_id}: ignored invalid skill call (${event.reason})`;
   } else if (event.event === "simulation_completed") {
     state.simulation.message = event.tool_calls?.length
       ? `Stopped at client tool boundary / ${event.tool_calls.length} call(s) requested`
